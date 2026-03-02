@@ -44,6 +44,16 @@ FIT_EDGE_MARGIN_PX = 1
 FIT_EDGE_REJECT_DIST_RATIO = 0.22
 GUIDE_OFFSET_ADAPT_GAIN = 0.025
 GUIDE_OFFSET_MAX = 0.25
+GUIDE_GAIN_MAX = 1.70
+GUIDE_GAIN_MIN = 0.85
+GUIDE_GAIN_ADAPT_X = 0.030
+GUIDE_GAIN_ADAPT_Y = 0.050
+GUIDE_GAIN_DECAY = 0.08
+GUIDE_MIN_TARGET_EXCURSION = 0.06
+GUIDE_UNDERREACH_MARGIN = 0.020
+GUIDE_OVERSHOOT_SCALE = 1.12
+FIT_ITER_WEIGHT_FLOOR = 0.25
+FIT_ITER_WEIGHT_HITRATE_GAIN = 0.75
 
 
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
@@ -117,6 +127,14 @@ def derive_mapper_settings(payload):
     ws = []
     for it in payload["iterations"]:
         box = it["target_box"]
+        hit_rate = float(it.get("summary", {}).get("hit_rate", 0.0))
+        iter_weight = float(
+            np.clip(
+                FIT_ITER_WEIGHT_FLOOR + FIT_ITER_WEIGHT_HITRATE_GAIN * hit_rate,
+                FIT_ITER_WEIGHT_FLOOR,
+                1.0,
+            )
+        )
         cx = (float(box["x1"]) + float(box["x2"])) * 0.5
         cy = (float(box["y1"]) + float(box["y2"])) * 0.5
         tx = float(np.clip(cx / max(sw - 1.0, 1.0), 0.0, 1.0))
@@ -155,7 +173,7 @@ def derive_mapper_settings(payload):
             txs.append(tx)
             tys.append(ty)
             # Prefer samples that actually approached the target.
-            ws.append(iter_weight_scale / (1.0 + dist_center / (0.35 * screen_diag)))
+            ws.append(iter_weight * iter_weight_scale / (1.0 + dist_center / (0.35 * screen_diag)))
     if len(hs) < 24:
         return None
 
@@ -222,6 +240,26 @@ def distance_to_box(sx, sy, x1, y1, x2, y2):
     dx = max(x1 - sx, 0, sx - x2)
     dy = max(y1 - sy, 0, sy - y2)
     return float(np.hypot(dx, dy))
+
+
+def _adapt_guide_gain(curr_gain, cursor_norm, target_norm, adapt_rate):
+    """Temporarily adapt per-iteration gain to reduce edge under-reach."""
+    target_centered = target_norm - 0.5
+    cursor_centered = cursor_norm - 0.5
+    target_mag = abs(target_centered)
+    cursor_mag = abs(cursor_centered)
+    same_side = target_centered * cursor_centered > 0.0
+
+    next_gain = curr_gain
+    if target_mag < GUIDE_MIN_TARGET_EXCURSION:
+        next_gain += (1.0 - curr_gain) * GUIDE_GAIN_DECAY
+    elif same_side and (cursor_mag + GUIDE_UNDERREACH_MARGIN) < target_mag:
+        next_gain += adapt_rate * (target_mag - cursor_mag)
+    elif cursor_mag > (target_mag * GUIDE_OVERSHOOT_SCALE):
+        next_gain += GUIDE_GAIN_DECAY * (1.0 - curr_gain)
+    else:
+        next_gain += GUIDE_GAIN_DECAY * (1.0 - curr_gain)
+    return float(np.clip(next_gain, GUIDE_GAIN_MIN, GUIDE_GAIN_MAX))
 
 
 def main():
@@ -295,6 +333,8 @@ def main():
                 # each target independent and prevents carry-over bias.
                 mapper.set_x_offset(0.0)
                 mapper.set_y_offset(0.0)
+                mapper.set_x_gain(1.0)
+                mapper.set_y_gain(1.0)
             box = random_box(sw, sh, rng)
             x1, y1, x2, y2 = box
             cx = (x1 + x2) / 2.0
@@ -380,6 +420,26 @@ def main():
                         next_y_off = mapper.y_offset + GUIDE_OFFSET_ADAPT_GAIN * err_y
                         mapper.set_x_offset(float(np.clip(next_x_off, -GUIDE_OFFSET_MAX, GUIDE_OFFSET_MAX)))
                         mapper.set_y_offset(float(np.clip(next_y_off, -GUIDE_OFFSET_MAX, GUIDE_OFFSET_MAX)))
+                        target_x_norm = float(cx / max(float(sw - 1), 1.0))
+                        target_y_norm = float(cy / max(float(sh - 1), 1.0))
+                        cursor_x_norm = float(sx_i / max(float(sw - 1), 1.0))
+                        cursor_y_norm = float(sy_i / max(float(sh - 1), 1.0))
+                        mapper.set_x_gain(
+                            _adapt_guide_gain(
+                                mapper.x_gain,
+                                cursor_x_norm,
+                                target_x_norm,
+                                GUIDE_GAIN_ADAPT_X,
+                            )
+                        )
+                        mapper.set_y_gain(
+                            _adapt_guide_gain(
+                                mapper.y_gain,
+                                cursor_y_norm,
+                                target_y_norm,
+                                GUIDE_GAIN_ADAPT_Y,
+                            )
+                        )
 
                     if not flip_eval_locked:
                         flip_eval_samples += 1
