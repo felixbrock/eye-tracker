@@ -29,6 +29,7 @@ from eye_tracker import (
 
 ITERATION_SECONDS = 5.0
 TOTAL_ITERATIONS = 5
+ITERATION_SAMPLE_WARMUP_SECONDS = 0.40
 BOX_W_RATIO = 0.14
 BOX_H_RATIO = 0.18
 OUT_DIR = "calibration_logs"
@@ -44,6 +45,9 @@ FIT_EDGE_MARGIN_PX = 1
 FIT_EDGE_REJECT_DIST_RATIO = 0.22
 GUIDE_OFFSET_ADAPT_GAIN = 0.025
 GUIDE_OFFSET_MAX = 0.25
+GUIDE_OFFSET_MIN = 0.08
+GUIDE_OFFSET_EDGE_EXCURSION = 0.30
+GUIDE_OFFSET_DECAY = 0.05
 GUIDE_GAIN_MAX = 1.70
 GUIDE_GAIN_MIN = 0.85
 GUIDE_GAIN_ADAPT_X = 0.030
@@ -262,6 +266,13 @@ def _adapt_guide_gain(curr_gain, cursor_norm, target_norm, adapt_rate):
     return float(np.clip(next_gain, GUIDE_GAIN_MIN, GUIDE_GAIN_MAX))
 
 
+def _guide_offset_limit(target_norm):
+    """Scale temporary offset headroom by target eccentricity."""
+    excursion = abs(float(target_norm) - 0.5)
+    t = float(np.clip(excursion / GUIDE_OFFSET_EDGE_EXCURSION, 0.0, 1.0))
+    return float(GUIDE_OFFSET_MIN + (GUIDE_OFFSET_MAX - GUIDE_OFFSET_MIN) * t)
+
+
 def main():
     monitor = get_monitors()[0]
     sw, sh = monitor.width, monitor.height
@@ -407,6 +418,10 @@ def main():
                     (h, v), _ = result
                     mapped_points = {}
                     center_dists = {}
+                    target_x_norm = float(cx / max(float(sw - 1), 1.0))
+                    target_y_norm = float(cy / max(float(sh - 1), 1.0))
+                    max_x_off = _guide_offset_limit(target_x_norm)
+                    max_y_off = _guide_offset_limit(target_y_norm)
                     for flip_y, mapper in probe_mappers.items():
                         sx_i, sy_i = mapper.map(h, v)
                         mapped_points[flip_y] = (sx_i, sy_i)
@@ -416,12 +431,10 @@ def main():
                         # gross bias/lag during sampling.
                         err_x = (cx - float(sx_i)) / max(float(sw - 1), 1.0)
                         err_y = (cy - float(sy_i)) / max(float(sh - 1), 1.0)
-                        next_x_off = mapper.x_offset + GUIDE_OFFSET_ADAPT_GAIN * err_x
-                        next_y_off = mapper.y_offset + GUIDE_OFFSET_ADAPT_GAIN * err_y
-                        mapper.set_x_offset(float(np.clip(next_x_off, -GUIDE_OFFSET_MAX, GUIDE_OFFSET_MAX)))
-                        mapper.set_y_offset(float(np.clip(next_y_off, -GUIDE_OFFSET_MAX, GUIDE_OFFSET_MAX)))
-                        target_x_norm = float(cx / max(float(sw - 1), 1.0))
-                        target_y_norm = float(cy / max(float(sh - 1), 1.0))
+                        next_x_off = mapper.x_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_x
+                        next_y_off = mapper.y_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_y
+                        mapper.set_x_offset(float(np.clip(next_x_off, -max_x_off, max_x_off)))
+                        mapper.set_y_offset(float(np.clip(next_y_off, -max_y_off, max_y_off)))
                         cursor_x_norm = float(sx_i / max(float(sw - 1), 1.0))
                         cursor_y_norm = float(sy_i / max(float(sh - 1), 1.0))
                         mapper.set_x_gain(
@@ -469,24 +482,29 @@ def main():
                     dist_box_px = distance_to_box(sx, sy, x1, y1, x2, y2)
                     dist_center_px = float(np.hypot(sx - cx, sy - cy))
 
-                    samples.append(
-                        {
-                            "iteration_index": iteration_index,
-                            "t": elapsed,
-                            "cursor_x": int(sx),
-                            "cursor_y": int(sy),
-                            "iris_h": float(h),
-                            "iris_v": float(v),
-                            "inside_box": bool(inside),
-                            "distance_to_box_px": dist_box_px,
-                            "distance_to_box_center_px": dist_center_px,
-                        }
-                    )
+                    if elapsed >= ITERATION_SAMPLE_WARMUP_SECONDS:
+                        samples.append(
+                            {
+                                "iteration_index": iteration_index,
+                                "t": elapsed,
+                                "cursor_x": int(sx),
+                                "cursor_y": int(sy),
+                                "iris_h": float(h),
+                                "iris_v": float(v),
+                                "inside_box": bool(inside),
+                                "distance_to_box_px": dist_box_px,
+                                "distance_to_box_center_px": dist_center_px,
+                            }
+                        )
 
                     color = (0, 220, 0) if inside else (0, 255, 255)
                     cv2.circle(disp, (int(sx), int(sy)), 10, color, -1)
 
-                    hit_rate = sum(1 for s in samples if s["inside_box"]) / float(len(samples))
+                    hit_rate = (
+                        sum(1 for s in samples if s["inside_box"]) / float(len(samples))
+                        if samples
+                        else 0.0
+                    )
                     cv2.putText(
                         disp,
                         f"Live hit-rate: {hit_rate * 100.0:0.1f}%",
