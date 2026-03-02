@@ -478,9 +478,8 @@ def main():
                 if not ret:
                     continue
 
-                # Capture raw gaze ratios for calibration fitting to avoid
-                # coupling compensation dynamics into the trained bounds.
-                result = tracker.process(frame, apply_head_comp=False, return_meta=True)
+                # Fit using the same compensated gaze stream used at runtime.
+                result = tracker.process(frame, apply_head_comp=True, return_meta=True)
                 disp = np.zeros((sh, sw, 3), dtype=np.uint8)
 
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -612,6 +611,8 @@ def main():
                         and elapsed >= TARGET_SETTLE_SECONDS
                         and (elapsed - settled_since) >= TARGET_DWELL_SECONDS
                     ):
+                        for mapper in probe_mappers.values():
+                            mapper.lock_calibration_boost()
                         capture_started_at = elapsed
 
                     if capture_started_at is not None and quality_ok:

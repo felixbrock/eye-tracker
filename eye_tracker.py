@@ -118,6 +118,7 @@ CALIBRATION_RAW_STEP_SCALE = 0.78
 CALIBRATION_MAD_LIMIT_SCALE = 0.82
 CALIBRATION_RANGE_MIN_SAMPLES = 18
 CALIBRATION_MAX_AUTO_RANGE_BOOST = 1.60
+CALIBRATION_BOOST_ALPHA = 0.22
 CALIBRATION_SOFT_CLIP_STRENGTH = 1.60
 CALIBRATION_SOFT_CLIP_MAX_STRENGTH = 3.00
 
@@ -314,6 +315,8 @@ class GazeMapper:
         self.x_gain = 1.0
         self.y_offset = 0.0
         self.y_gain = 1.0
+        self.y_x_coupling = 0.0
+        self.y_x_center = 0.5
         self._raw_h_hist = deque(maxlen=3)
         self._raw_v_hist = deque(maxlen=3)
         self._range_h_hist = deque(maxlen=RANGE_WINDOW)
@@ -458,6 +461,15 @@ class GazeMapper:
         self._calibration_boost_y = 1.0
         self._calibration_boost_locked = False
 
+    def lock_calibration_boost(self):
+        """Freeze calibration boost after stabilization to avoid mid-capture jumps."""
+        if self._calibration_boost_locked:
+            return
+        abx, aby = self._auto_range_boost()
+        self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
+        self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
+        self._calibration_boost_locked = True
+
     def _auto_range_boost(self):
         if len(self._range_h_hist) < RANGE_MIN_SAMPLES:
             return 1.0, 1.0
@@ -542,6 +554,8 @@ class GazeMapper:
                 return self.history[-1]
             return self.sw // 2, self.sh // 2
         h, v = filtered
+        if abs(self.y_x_coupling) > 1e-7:
+            v = float(np.clip(v - self.y_x_coupling * (h - self.y_x_center), 0.0, 1.0))
         self._range_h_hist.append(h)
         self._range_v_hist.append(v)
 
@@ -559,14 +573,15 @@ class GazeMapper:
         # Expand tiny live iris spans so edge targets remain reachable even when
         # a user naturally has limited eye-lid aperture in one axis.
         if self.calibration_mode:
-            # Keep calibration behavior stable: lock a conservative boost
-            # once enough samples are observed instead of continuously adapting.
-            lock_ready_samples = max(CALIBRATION_RANGE_MIN_SAMPLES, RANGE_MIN_SAMPLES)
-            if (not self._calibration_boost_locked) and len(self._range_h_hist) >= lock_ready_samples:
+            # Track live span gradually during settle/seek, then freeze it
+            # once capture starts (triggered by calibration.py).
+            if not self._calibration_boost_locked:
                 abx, aby = self._auto_range_boost()
-                self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
-                self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
-                self._calibration_boost_locked = True
+                target_bx = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
+                target_by = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
+                a = CALIBRATION_BOOST_ALPHA
+                self._calibration_boost_x = (1.0 - a) * self._calibration_boost_x + a * target_bx
+                self._calibration_boost_y = (1.0 - a) * self._calibration_boost_y + a * target_by
             bx, by = self._calibration_boost_x, self._calibration_boost_y
         else:
             bx, by = self._auto_range_boost()
@@ -766,6 +781,8 @@ class GazeMapper:
             "x_gain": self.x_gain,
             "y_offset": self.y_offset,
             "y_gain": self.y_gain,
+            "y_x_coupling": self.y_x_coupling,
+            "y_x_center": self.y_x_center,
         }
         payload = _json_safe(payload)
         # Atomic write to avoid truncated/corrupt JSON when interrupted.
@@ -792,6 +809,8 @@ class GazeMapper:
         self.x_gain = 1.0
         self.y_offset = 0.0
         self.y_gain = 1.0
+        self.y_x_coupling = 0.0
+        self.y_x_center = 0.5
         self.clear_runtime_state(reset_bias=True)
         if os.path.exists(SETTINGS_FILE):
             os.remove(SETTINGS_FILE)
@@ -841,6 +860,20 @@ class GazeMapper:
                 self.x_gain = float(d.get("x_gain", self.x_gain))
                 self.y_offset = float(d.get("y_offset", self.y_offset))
                 self.y_gain = float(d.get("y_gain", self.y_gain))
+                y_x_coupling = d.get("y_x_coupling", self.y_x_coupling)
+                y_x_center = d.get("y_x_center", self.y_x_center)
+                try:
+                    y_x_coupling = float(y_x_coupling)
+                    if np.isfinite(y_x_coupling):
+                        self.y_x_coupling = float(np.clip(y_x_coupling, -2.0, 2.0))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    y_x_center = float(y_x_center)
+                    if np.isfinite(y_x_center):
+                        self.y_x_center = float(np.clip(y_x_center, -0.5, 1.5))
+                except (TypeError, ValueError):
+                    pass
                 self.set_x_offset(self.x_offset)
                 self.set_x_gain(self.x_gain)
                 self.set_y_offset(self.y_offset)
