@@ -35,6 +35,8 @@ BOX_H_RATIO = 0.18
 OUT_DIR = "calibration_logs"
 FLIP_EVAL_MIN_SAMPLES = 90
 FLIP_EVAL_REL_MARGIN = 0.06
+FLIP_ACTIVE_MIN_SAMPLES = 18
+FLIP_ACTIVE_REL_MARGIN = 0.03
 BND_MIN = -0.20
 BND_MAX = 1.20
 SPAN_MIN = 0.18
@@ -48,6 +50,8 @@ GUIDE_OFFSET_MAX = 0.25
 GUIDE_OFFSET_MIN = 0.08
 GUIDE_OFFSET_EDGE_EXCURSION = 0.30
 GUIDE_OFFSET_DECAY = 0.05
+GUIDE_OFFSET_STEP_MAX = 0.022
+GUIDE_OFFSET_CROSS_GAIN_BOOST = 1.9
 GUIDE_GAIN_MAX = 1.70
 GUIDE_GAIN_MIN = 0.85
 GUIDE_GAIN_ADAPT_X = 0.030
@@ -56,6 +60,7 @@ GUIDE_GAIN_DECAY = 0.08
 GUIDE_MIN_TARGET_EXCURSION = 0.06
 GUIDE_UNDERREACH_MARGIN = 0.020
 GUIDE_OVERSHOOT_SCALE = 1.12
+GUIDE_CROSS_GAIN_ADAPT = 0.018
 FIT_ITER_WEIGHT_FLOOR = 0.25
 FIT_ITER_WEIGHT_HITRATE_GAIN = 0.75
 
@@ -257,6 +262,10 @@ def _adapt_guide_gain(curr_gain, cursor_norm, target_norm, adapt_rate):
     next_gain = curr_gain
     if target_mag < GUIDE_MIN_TARGET_EXCURSION:
         next_gain += (1.0 - curr_gain) * GUIDE_GAIN_DECAY
+    elif (not same_side) and cursor_mag > (0.5 * GUIDE_MIN_TARGET_EXCURSION):
+        # If the cursor is on the opposite side of center from target, add
+        # temporary gain so guidance can cross center instead of stalling.
+        next_gain += GUIDE_CROSS_GAIN_ADAPT * (target_mag + cursor_mag)
     elif same_side and (cursor_mag + GUIDE_UNDERREACH_MARGIN) < target_mag:
         next_gain += adapt_rate * (target_mag - cursor_mag)
     elif cursor_mag > (target_mag * GUIDE_OVERSHOOT_SCALE):
@@ -271,6 +280,20 @@ def _guide_offset_limit(target_norm):
     excursion = abs(float(target_norm) - 0.5)
     t = float(np.clip(excursion / GUIDE_OFFSET_EDGE_EXCURSION, 0.0, 1.0))
     return float(GUIDE_OFFSET_MIN + (GUIDE_OFFSET_MAX - GUIDE_OFFSET_MIN) * t)
+
+
+def _adapt_guide_offset(curr_off, err, cursor_norm, target_norm, max_off):
+    target_centered = float(target_norm) - 0.5
+    cursor_centered = float(cursor_norm) - 0.5
+    same_side = target_centered * cursor_centered > 0.0
+    gain = GUIDE_OFFSET_ADAPT_GAIN
+    if (not same_side) and abs(target_centered) >= GUIDE_MIN_TARGET_EXCURSION:
+        gain *= GUIDE_OFFSET_CROSS_GAIN_BOOST
+
+    desired = curr_off * (1.0 - GUIDE_OFFSET_DECAY) + gain * float(err)
+    delta = float(np.clip(desired - curr_off, -GUIDE_OFFSET_STEP_MAX, GUIDE_OFFSET_STEP_MAX))
+    next_off = curr_off + delta
+    return float(np.clip(next_off, -max_off, max_off))
 
 
 def main():
@@ -431,12 +454,26 @@ def main():
                         # gross bias/lag during sampling.
                         err_x = (cx - float(sx_i)) / max(float(sw - 1), 1.0)
                         err_y = (cy - float(sy_i)) / max(float(sh - 1), 1.0)
-                        next_x_off = mapper.x_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_x
-                        next_y_off = mapper.y_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_y
-                        mapper.set_x_offset(float(np.clip(next_x_off, -max_x_off, max_x_off)))
-                        mapper.set_y_offset(float(np.clip(next_y_off, -max_y_off, max_y_off)))
                         cursor_x_norm = float(sx_i / max(float(sw - 1), 1.0))
                         cursor_y_norm = float(sy_i / max(float(sh - 1), 1.0))
+                        mapper.set_x_offset(
+                            _adapt_guide_offset(
+                                mapper.x_offset,
+                                err_x,
+                                cursor_x_norm,
+                                target_x_norm,
+                                max_x_off,
+                            )
+                        )
+                        mapper.set_y_offset(
+                            _adapt_guide_offset(
+                                mapper.y_offset,
+                                err_y,
+                                cursor_y_norm,
+                                target_y_norm,
+                                max_y_off,
+                            )
+                        )
                         mapper.set_x_gain(
                             _adapt_guide_gain(
                                 mapper.x_gain,
@@ -458,6 +495,13 @@ def main():
                         flip_eval_samples += 1
                         flip_eval_total_dist[False] += center_dists[False]
                         flip_eval_total_dist[True] += center_dists[True]
+                        if flip_eval_samples >= FLIP_ACTIVE_MIN_SAMPLES:
+                            mean_false = flip_eval_total_dist[False] / float(flip_eval_samples)
+                            mean_true = flip_eval_total_dist[True] / float(flip_eval_samples)
+                            best = min(mean_false, mean_true)
+                            worst = max(mean_false, mean_true)
+                            if (worst - best) / max(worst, 1.0) >= FLIP_ACTIVE_REL_MARGIN:
+                                active_flip_y = mean_true < mean_false
                         if flip_eval_samples >= FLIP_EVAL_MIN_SAMPLES:
                             mean_false = flip_eval_total_dist[False] / float(flip_eval_samples)
                             mean_true = flip_eval_total_dist[True] / float(flip_eval_samples)
@@ -472,12 +516,7 @@ def main():
                                     f"(mean center distance false={mean_false:.1f}, true={mean_true:.1f})"
                                 )
 
-                    # Always use whichever polarity is currently closer to the
-                    # target for guidance. We still keep lock/eval stats for
-                    # selecting persisted flip_y at the end.
-                    selected_flip_y = center_dists[True] < center_dists[False]
-
-                    sx, sy = mapped_points[selected_flip_y]
+                    sx, sy = mapped_points[active_flip_y]
                     inside = x1 <= sx <= x2 and y1 <= sy <= y2
                     dist_box_px = distance_to_box(sx, sy, x1, y1, x2, y2)
                     dist_center_px = float(np.hypot(sx - cx, sy - cy))
