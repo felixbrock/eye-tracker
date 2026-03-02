@@ -581,9 +581,13 @@ PY
     if [[ "$auto_retry" -eq 1 ]]; then
       if [[ "$max_attempts" -eq 0 || "$attempt_index" -lt "$max_attempts" ]]; then
         next_attempt=$((attempt_index + 1))
+        retry_log_file="${validation_used_file##*,}"
+        if [[ -z "$retry_log_file" ]]; then
+          retry_log_file="$validation_used_file"
+        fi
         echo "Auto-retrying tuning (attempt ${next_attempt})..."
         exec "$script_path" \
-          --log-file "$validation_used_file" \
+          --log-file "$retry_log_file" \
           --codex-cmd "$codex_cmd" \
           --history-count "$history_count" \
           --validation-runs "$validation_runs" \
