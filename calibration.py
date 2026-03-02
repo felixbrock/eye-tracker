@@ -38,6 +38,10 @@ BND_MIN = -0.20
 BND_MAX = 1.20
 SPAN_MIN = 0.18
 SPAN_MAX = 0.55
+FIT_KEEP_FRACTION = 0.35
+FIT_KEEP_MIN_SAMPLES = 18
+FIT_EDGE_MARGIN_PX = 1
+FIT_EDGE_REJECT_DIST_RATIO = 0.22
 
 
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
@@ -123,10 +127,24 @@ def derive_mapper_settings(payload):
         if not iter_samples:
             continue
         dists = np.asarray([float(s["distance_to_box_center_px"]) for s in iter_samples], dtype=float)
-        keep_threshold = float(np.percentile(dists, 40.0))
-        for s in iter_samples:
+        order = np.argsort(dists)
+        keep_n = int(max(FIT_KEEP_MIN_SAMPLES, round(len(iter_samples) * FIT_KEEP_FRACTION)))
+        keep_n = min(keep_n, len(iter_samples))
+        iter_weight_scale = 1.0 / float(max(keep_n, 1))
+        keep_indices = set(int(i) for i in order[:keep_n])
+        for i, s in enumerate(iter_samples):
+            if i not in keep_indices:
+                continue
             dist_center = float(s["distance_to_box_center_px"])
-            if len(iter_samples) >= 12 and dist_center > keep_threshold:
+            sx = int(s["cursor_x"])
+            sy = int(s["cursor_y"])
+            edge_pinned = (
+                sx <= FIT_EDGE_MARGIN_PX
+                or sx >= int(sw) - 1 - FIT_EDGE_MARGIN_PX
+                or sy <= FIT_EDGE_MARGIN_PX
+                or sy >= int(sh) - 1 - FIT_EDGE_MARGIN_PX
+            )
+            if edge_pinned and dist_center > (FIT_EDGE_REJECT_DIST_RATIO * screen_diag):
                 continue
             h = float(s["iris_h"])
             v = float(s["iris_v"])
@@ -135,7 +153,7 @@ def derive_mapper_settings(payload):
             txs.append(tx)
             tys.append(ty)
             # Prefer samples that actually approached the target.
-            ws.append(1.0 / (1.0 + dist_center / (0.35 * screen_diag)))
+            ws.append(iter_weight_scale / (1.0 + dist_center / (0.35 * screen_diag)))
     if len(hs) < 24:
         return None
 

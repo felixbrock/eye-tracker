@@ -118,6 +118,7 @@ CALIBRATION_RAW_STEP_SCALE = 0.65
 CALIBRATION_MAD_LIMIT_SCALE = 0.75
 CALIBRATION_RANGE_MIN_SAMPLES = 18
 CALIBRATION_MAX_AUTO_RANGE_BOOST = 1.60
+CALIBRATION_SOFT_CLIP_STRENGTH = 1.60
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -597,8 +598,10 @@ class GazeMapper:
         y = 0.5 + (y - 0.5) * sy
 
         if self.calibration_mode:
-            x = float(np.clip(x, 0.0, 1.0))
-            y = float(np.clip(y, 0.0, 1.0))
+            # Keep calibration deterministic while avoiding prolonged edge
+            # saturation that can poison fitted bounds.
+            x = self._soft_clip_unit(x, strength=CALIBRATION_SOFT_CLIP_STRENGTH)
+            y = self._soft_clip_unit(y, strength=CALIBRATION_SOFT_CLIP_STRENGTH)
         else:
             # Compress extremes before clipping so temporary outliers are less likely
             # to hard-pin the cursor to screen edges.
@@ -700,11 +703,10 @@ class GazeMapper:
 
         return sx, sy
 
-    def _soft_clip_unit(self, val):
+    def _soft_clip_unit(self, val, strength=3.2):
         """Softly compress values into [0, 1] to reduce edge lock-in."""
         val = float(np.clip(val, -1.0, 2.0))
         centered = val - 0.5
-        strength = 3.2
         compressed = np.tanh(centered * strength)
         return float(np.clip(0.5 + 0.5 * compressed, 0.0, 1.0))
 
