@@ -432,8 +432,10 @@ class GazeMapper:
         v_lo, v_hi = np.percentile(vs, [10, 90])
         h_span = max(1e-4, float(h_hi - h_lo))
         v_span = max(1e-4, float(v_hi - v_lo))
-        bx = float(np.clip(TARGET_IRIS_SPAN_X / h_span, 0.85, MAX_AUTO_RANGE_BOOST))
-        by = float(np.clip(TARGET_IRIS_SPAN_Y / v_span, 0.85, MAX_AUTO_RANGE_BOOST))
+        # Only expand low-amplitude ranges here; avoid automatic shrink that can
+        # make edge reach worse on users with already narrow iris motion.
+        bx = float(np.clip(TARGET_IRIS_SPAN_X / h_span, 1.0, MAX_AUTO_RANGE_BOOST))
+        by = float(np.clip(TARGET_IRIS_SPAN_Y / v_span, 1.0, MAX_AUTO_RANGE_BOOST))
         return bx, by
 
     def _effective_bounds(self):
@@ -513,6 +515,12 @@ class GazeMapper:
         # Normalize to 0-1 based on bounds
         x = (h - x_min) / (x_max - x_min + 1e-7)
         y = (v - y_min) / (y_max - y_min + 1e-7)
+
+        # Expand tiny live iris spans so edge targets remain reachable even when
+        # a user naturally has limited eye-lid aperture in one axis.
+        bx, by = self._auto_range_boost()
+        x = 0.5 + (x - 0.5) * bx
+        y = 0.5 + (y - 0.5) * by
 
         if self.flip_x:
             x = 1.0 - x

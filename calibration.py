@@ -28,6 +28,8 @@ TOTAL_ITERATIONS = 5
 BOX_W_RATIO = 0.14
 BOX_H_RATIO = 0.18
 OUT_DIR = "calibration_logs"
+FLIP_EVAL_MIN_SAMPLES = 90
+FLIP_EVAL_REL_MARGIN = 0.06
 
 
 def random_box(sw, sh, rng):
@@ -71,14 +73,25 @@ def main():
 
     tracker = EyeTracker()
     # Keep calibration runs independent from any manually tuned persistent settings.
-    mapper = GazeMapper(sw, sh, load_saved_settings=False)
+    # Evaluate both vertical-polarity options and lock to the better one based
+    # on target-center distance during the run.
+    probe_mappers = {}
+    for flip_y in (False, True):
+        mapper = GazeMapper(sw, sh, load_saved_settings=False)
+        mapper.flip_y = flip_y
+        probe_mappers[flip_y] = mapper
+    active_flip_y = False
+    flip_eval_samples = 0
+    flip_eval_total_dist = {False: 0.0, True: 0.0}
+    flip_eval_locked = False
 
     win = "Calibration Iteration"
     all_iterations = []
 
     try:
         for iteration_index in range(1, TOTAL_ITERATIONS + 1):
-            mapper.clear_runtime_state(reset_bias=True)
+            for mapper in probe_mappers.values():
+                mapper.clear_runtime_state(reset_bias=True)
             tracker.reset_head_anchor()
             box = random_box(sw, sh, rng)
             x1, y1, x2, y2 = box
@@ -150,7 +163,32 @@ def main():
 
                 if result is not None:
                     (h, v), _ = result
-                    sx, sy = mapper.map(h, v)
+                    mapped_points = {}
+                    center_dists = {}
+                    for flip_y, mapper in probe_mappers.items():
+                        sx_i, sy_i = mapper.map(h, v)
+                        mapped_points[flip_y] = (sx_i, sy_i)
+                        center_dists[flip_y] = float(np.hypot(sx_i - cx, sy_i - cy))
+
+                    if not flip_eval_locked:
+                        flip_eval_samples += 1
+                        flip_eval_total_dist[False] += center_dists[False]
+                        flip_eval_total_dist[True] += center_dists[True]
+                        if flip_eval_samples >= FLIP_EVAL_MIN_SAMPLES:
+                            mean_false = flip_eval_total_dist[False] / float(flip_eval_samples)
+                            mean_true = flip_eval_total_dist[True] / float(flip_eval_samples)
+                            best = min(mean_false, mean_true)
+                            worst = max(mean_false, mean_true)
+                            if (worst - best) / max(worst, 1.0) >= FLIP_EVAL_REL_MARGIN:
+                                active_flip_y = mean_true < mean_false
+                                flip_eval_locked = True
+                                print(
+                                    "Auto flip-y locked to "
+                                    f"{active_flip_y} after {flip_eval_samples} samples "
+                                    f"(mean center distance false={mean_false:.1f}, true={mean_true:.1f})"
+                                )
+
+                    sx, sy = mapped_points[active_flip_y]
                     inside = x1 <= sx <= x2 and y1 <= sy <= y2
                     dist_box_px = distance_to_box(sx, sy, x1, y1, x2, y2)
                     dist_center_px = float(np.hypot(sx - cx, sy - cy))
@@ -219,6 +257,13 @@ def main():
             "screen": {"width": sw, "height": sh},
             "iteration_seconds": ITERATION_SECONDS,
             "total_iterations": TOTAL_ITERATIONS,
+            "auto_flip_y_selected": active_flip_y,
+            "auto_flip_y_locked": flip_eval_locked,
+            "auto_flip_eval_samples": flip_eval_samples,
+            "auto_flip_mean_center_distance_px": {
+                "flip_y_false": (flip_eval_total_dist[False] / float(flip_eval_samples)) if flip_eval_samples else None,
+                "flip_y_true": (flip_eval_total_dist[True] / float(flip_eval_samples)) if flip_eval_samples else None,
+            },
             "iterations": all_iterations,
         }
 
