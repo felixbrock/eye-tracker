@@ -305,7 +305,11 @@ if hard_fail:
 else:
     print("hard_fail_reasons=")
 PY
-  source "$gate_tmp"
+  passed="$(sed -n 's/^passed=//p' "$gate_tmp" | head -n 1)"
+  hit_improved="$(sed -n 's/^hit_improved=//p' "$gate_tmp" | head -n 1)"
+  box_improved="$(sed -n 's/^box_improved=//p' "$gate_tmp" | head -n 1)"
+  center_improved="$(sed -n 's/^center_improved=//p' "$gate_tmp" | head -n 1)"
+  hard_fail_reasons="$(sed -n 's/^hard_fail_reasons=//p' "$gate_tmp" | head -n 1)"
   rm -f "$gate_tmp"
 
   echo "Baseline metrics: hit_rate=${base_hit_rate}, dist_box_px=${base_dist_box}, dist_center_px=${base_dist_center}"
