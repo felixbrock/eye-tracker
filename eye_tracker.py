@@ -273,9 +273,17 @@ class EyeTracker:
 class GazeMapper:
     """Maps iris ratio → screen coordinates with optional persisted settings."""
 
-    def __init__(self, screen_w, screen_h, smoothing=SMOOTHING_FRAMES, load_saved_settings=True):
+    def __init__(
+        self,
+        screen_w,
+        screen_h,
+        smoothing=SMOOTHING_FRAMES,
+        load_saved_settings=True,
+        calibration_mode=False,
+    ):
         self.sw = screen_w
         self.sh = screen_h
+        self.calibration_mode = bool(calibration_mode)
         self.history = deque(maxlen=smoothing)
         self.sensitivity_x = SENSITIVITY_X
         self.sensitivity_y = SENSITIVITY_Y
@@ -532,23 +540,31 @@ class GazeMapper:
         # Independent vertical range expansion/compression around center.
         y = 0.5 + (y - 0.5) * self.y_gain
 
-        # Apply sensitivity: amplify deviation from center
-        x = 0.5 + (x - 0.5) * self.sensitivity_x
-        y = 0.5 + (y - 0.5) * self.sensitivity_y
+        # Apply sensitivity: amplify deviation from center.
+        # Calibration mode intentionally keeps this linear/low-gain to avoid
+        # edge lock-in while collecting fitting samples.
+        sx = min(self.sensitivity_x, 1.0) if self.calibration_mode else self.sensitivity_x
+        sy = min(self.sensitivity_y, 1.0) if self.calibration_mode else self.sensitivity_y
+        x = 0.5 + (x - 0.5) * sx
+        y = 0.5 + (y - 0.5) * sy
 
-        # Compress extremes before clipping so temporary outliers are less likely
-        # to hard-pin the cursor to screen edges.
-        x = self._soft_clip_unit(x)
-        y = self._soft_clip_unit(y)
+        if self.calibration_mode:
+            x = float(np.clip(x, 0.0, 1.0))
+            y = float(np.clip(y, 0.0, 1.0))
+        else:
+            # Compress extremes before clipping so temporary outliers are less likely
+            # to hard-pin the cursor to screen edges.
+            x = self._soft_clip_unit(x)
+            y = self._soft_clip_unit(y)
 
-        # Apply power curve to push values toward edges.
-        # This makes small movements near center less sticky and
-        # helps the gaze actually reach screen edges.
-        x = self._power_curve(x)
-        y = self._power_curve(y)
+            # Apply power curve to push values toward edges.
+            # This makes small movements near center less sticky and
+            # helps the gaze actually reach screen edges.
+            x = self._power_curve(x)
+            y = self._power_curve(y)
 
         self._norm_xy_hist.append((x, y))
-        if len(self._norm_xy_hist) >= RUNTIME_BIAS_MIN_SAMPLES:
+        if (not self.calibration_mode) and len(self._norm_xy_hist) >= RUNTIME_BIAS_MIN_SAMPLES:
             mx = float(np.mean([p[0] for p in self._norm_xy_hist]))
             my = float(np.mean([p[1] for p in self._norm_xy_hist]))
             sx_lo, sx_hi = np.percentile([p[0] for p in self._norm_xy_hist], [5, 95])

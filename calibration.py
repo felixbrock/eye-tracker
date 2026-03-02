@@ -187,7 +187,7 @@ def main():
     # on target-center distance during the run.
     probe_mappers = {}
     for flip_y in (False, True):
-        mapper = GazeMapper(sw, sh, load_saved_settings=False)
+        mapper = GazeMapper(sw, sh, load_saved_settings=False, calibration_mode=True)
         mapper.flip_y = flip_y
         probe_mappers[flip_y] = mapper
     active_flip_y = False
@@ -298,7 +298,13 @@ def main():
                                     f"(mean center distance false={mean_false:.1f}, true={mean_true:.1f})"
                                 )
 
-                    sx, sy = mapped_points[active_flip_y]
+                    selected_flip_y = active_flip_y
+                    if not flip_eval_locked:
+                        # Before lock, use whichever polarity is currently closer
+                        # to target center for better live guidance.
+                        selected_flip_y = center_dists[True] < center_dists[False]
+
+                    sx, sy = mapped_points[selected_flip_y]
                     inside = x1 <= sx <= x2 and y1 <= sy <= y2
                     dist_box_px = distance_to_box(sx, sy, x1, y1, x2, y2)
                     dist_center_px = float(np.hypot(sx - cx, sy - cy))
