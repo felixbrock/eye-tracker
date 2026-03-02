@@ -91,6 +91,7 @@ MAX_DYNAMIC_CENTER_SHIFT_Y = 0.03
 HEAD_ANCHOR_ALPHA = 0.035
 HEAD_ANCHOR_WARMUP_FRAMES = 12
 HEAD_ANCHOR_WARMUP_ALPHA = 0.30
+HEAD_ANCHOR_EDGE_ADAPT_FLOOR = 0.25
 RUNTIME_BIAS_UPDATE = 0.012
 RUNTIME_BIAS_MAX = 0.08
 RUNTIME_BIAS_DECAY = 0.97
@@ -218,6 +219,7 @@ class EyeTracker:
             self._head_anchor_warmup_left -= 1
 
         ax, ay, ascale = self.head_anchor
+        edge_blend = 0.0
         if apply_head_comp and self._head_anchor_warmup_left <= 0:
             # Clamp compensation inputs to prevent short head-motion spikes from
             # over-correcting gaze and collapsing usable vertical range.
@@ -240,7 +242,10 @@ class EyeTracker:
         # Keep anchor adaptive to slow posture changes while preserving
         # compensation against short-term head motion.
         if self._head_anchor_warmup_left <= 0:
-            a = HEAD_ANCHOR_ALPHA
+            # Do not let prolonged off-center gaze rapidly absorb into the
+            # anchor; that can decay compensation and cause drift away.
+            adapt_scale = 1.0 - (1.0 - HEAD_ANCHOR_EDGE_ADAPT_FLOOR) * edge_blend
+            a = HEAD_ANCHOR_ALPHA * adapt_scale
             self.head_anchor = (
                 (1.0 - a) * ax + a * hx,
                 (1.0 - a) * ay + a * hy,
