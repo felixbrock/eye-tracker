@@ -68,11 +68,11 @@ SETTINGS_FILE = os.path.expanduser("~/.config/gaze_settings.json")
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 # Head-pose compensation coefficients (empirical).
 # These offsets are applied to iris ratios after head-anchor capture.
-HEAD_COMP_X_FROM_DX = 0.14
-HEAD_COMP_Y_FROM_DY = 0.10
-HEAD_COMP_Y_FROM_SCALE = 0.015
-HEAD_COMP_MAX_X = 0.035
-HEAD_COMP_MAX_Y = 0.045
+HEAD_COMP_X_FROM_DX = 0.11
+HEAD_COMP_Y_FROM_DY = 0.075
+HEAD_COMP_Y_FROM_SCALE = 0.010
+HEAD_COMP_MAX_X = 0.030
+HEAD_COMP_MAX_Y = 0.035
 UFO_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "ufo.png")
 RANGE_WINDOW = 220
 RANGE_MIN_SAMPLES = 30
@@ -198,6 +198,8 @@ class EyeTracker:
 
         h = (lh + rh) / 2
         v = (lv + rv) / 2
+        raw_h = h
+        raw_v = v
         hx, hy, hs = self._head_features(lm)
 
         if self.head_anchor is None:
@@ -223,6 +225,13 @@ class EyeTracker:
             x_comp = float(np.clip(HEAD_COMP_X_FROM_DX * dx_norm, -HEAD_COMP_MAX_X, HEAD_COMP_MAX_X))
             y_comp = HEAD_COMP_Y_FROM_DY * dy_norm + HEAD_COMP_Y_FROM_SCALE * dscale
             y_comp = float(np.clip(y_comp, -HEAD_COMP_MAX_Y, HEAD_COMP_MAX_Y))
+            # Preserve prior head-motion correction near center gaze, but
+            # reduce cancellation when user intentionally looks toward edges.
+            gaze_excursion = max(abs(raw_h - 0.5), abs(raw_v - 0.5))
+            edge_blend = float(np.clip((gaze_excursion - 0.06) / 0.24, 0.0, 1.0))
+            comp_scale = 1.0 - 0.45 * edge_blend
+            x_comp *= comp_scale
+            y_comp *= comp_scale
             h -= x_comp
             v -= y_comp
 
