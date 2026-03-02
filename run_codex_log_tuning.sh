@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_codex_log_tuning.sh --log-file <path> [--validation-log-file <path>] [--codex-cmd <cmd>] [--history-count <n>] [--skip-validation] [--auto-retry|--no-auto-retry] [--max-attempts <n>] [--dry-run]
+  ./run_codex_log_tuning.sh --log-file <path> [--validation-log-file <path>] [--validation-runs <n>] [--codex-cmd <cmd>] [--history-count <n>] [--skip-validation] [--auto-retry|--no-auto-retry] [--max-attempts <n>] [--dry-run]
 
 Description:
   Builds a prompt embedding the given log file and starts a new Codex CLI session
@@ -18,6 +18,7 @@ Description:
 Options:
   --log-file   Path to calibration log JSON (required)
   --validation-log-file Path to post-change calibration log JSON (optional; if omitted, script runs calibration.py)
+  --validation-runs Number of validation calibration runs to aggregate by median when auto-running validation (default: 2)
   --codex-cmd  Codex launcher command (default: codex)
   --history-count Number of recent relevant commits to include as context (default: 12)
   --skip-validation Skip performance gates and commit directly after syntax checks
@@ -31,6 +32,7 @@ EOF
 
 log_file=""
 validation_log_file=""
+validation_runs=2
 codex_cmd="codex"
 history_count=12
 skip_validation=0
@@ -56,6 +58,12 @@ while [[ $# -gt 0 ]]; do
     --validation-log-file)
       [[ $# -ge 2 ]] || { echo "ERROR: --validation-log-file requires a value" >&2; exit 2; }
       validation_log_file="$2"
+      shift 2
+      ;;
+    --validation-runs)
+      [[ $# -ge 2 ]] || { echo "ERROR: --validation-runs requires a value" >&2; exit 2; }
+      [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: --validation-runs must be a non-negative integer" >&2; exit 2; }
+      validation_runs="$2"
       shift 2
       ;;
     --history-count)
@@ -108,6 +116,10 @@ done
 [[ -f "$log_file" ]] || { echo "ERROR: log file not found: $log_file" >&2; exit 1; }
 if [[ -n "$validation_log_file" ]]; then
   [[ -f "$validation_log_file" ]] || { echo "ERROR: validation log file not found: $validation_log_file" >&2; exit 1; }
+fi
+if [[ "$validation_runs" -lt 1 ]]; then
+  echo "ERROR: --validation-runs must be >= 1" >&2
+  exit 1
 fi
 
 if ! command -v "$codex_cmd" >/dev/null 2>&1; then
@@ -420,36 +432,83 @@ if [[ "$skip_validation" -eq 1 ]]; then
 else
   if [[ -n "$abs_validation_log_file" ]]; then
     validation_used_file="$abs_validation_log_file"
+    extract_metrics "$validation_used_file" "$tmp_validation"
+    source "$tmp_validation"
+    new_hit_rate="$avg_hit_rate"
+    new_dist_box="$avg_dist_box_px"
+    new_dist_center="$avg_dist_center_px"
+    new_valid_samples="$total_valid_samples"
+    new_axis_score="$axis_score"
+    new_y_corr_abs="$y_corr_abs"
+    new_y_cross_abs="$y_cross_abs"
+    new_v_span="$v_span"
   else
     echo
-    echo "Running post-change calibration validation..."
-    uv run python calibration.py
-    latest_validation="$(ls -1t calibration_logs/iteration_*.json 2>/dev/null | head -n 1 || true)"
-    [[ -n "$latest_validation" ]] || {
-      rollback_repo_changes
-      echo "ERROR: no validation calibration log found after running calibration.py." >&2
-      exit 1
-    }
-    latest_validation_abs="$(realpath "$latest_validation")"
-    latest_validation_mtime="$(stat -c %Y "$latest_validation_abs")"
-    if [[ "$latest_validation_mtime" -lt "$tuning_start_epoch" ]]; then
-      rollback_repo_changes
-      echo "ERROR: latest calibration log predates tuning run; cannot validate." >&2
-      exit 1
-    fi
-    validation_used_file="$latest_validation_abs"
-  fi
+    echo "Running post-change calibration validation (${validation_runs} runs, median aggregation)..."
+    metrics_csv="$(mktemp)"
+    validation_list_file="$(mktemp)"
+    latest_seen_mtime=0
+    for run_i in $(seq 1 "$validation_runs"); do
+      echo "Validation run ${run_i}/${validation_runs}..."
+      uv run python calibration.py
+      latest_validation="$(ls -1t calibration_logs/iteration_*.json 2>/dev/null | head -n 1 || true)"
+      [[ -n "$latest_validation" ]] || {
+        rollback_repo_changes
+        rm -f "$metrics_csv" "$validation_list_file"
+        echo "ERROR: no validation calibration log found after running calibration.py." >&2
+        exit 1
+      }
+      latest_validation_abs="$(realpath "$latest_validation")"
+      latest_validation_mtime="$(stat -c %Y "$latest_validation_abs")"
+      if [[ "$latest_validation_mtime" -lt "$tuning_start_epoch" || "$latest_validation_mtime" -lt "$latest_seen_mtime" ]]; then
+        rollback_repo_changes
+        rm -f "$metrics_csv" "$validation_list_file"
+        echo "ERROR: validation log timestamp is invalid; cannot validate." >&2
+        exit 1
+      fi
+      latest_seen_mtime="$latest_validation_mtime"
+      echo "$latest_validation_abs" >> "$validation_list_file"
+      extract_metrics "$latest_validation_abs" "$tmp_validation"
+      source "$tmp_validation"
+      echo "${avg_hit_rate},${avg_dist_box_px},${avg_dist_center_px},${axis_score},${y_corr_abs},${y_cross_abs},${v_span},${total_valid_samples}" >> "$metrics_csv"
+    done
+    validation_used_file="$(paste -sd, "$validation_list_file")"
+    agg_tmp="$(mktemp)"
+    python3 - "$metrics_csv" <<'PY' > "$agg_tmp"
+import statistics
+import sys
 
-  extract_metrics "$validation_used_file" "$tmp_validation"
-  source "$tmp_validation"
-  new_hit_rate="$avg_hit_rate"
-  new_dist_box="$avg_dist_box_px"
-  new_dist_center="$avg_dist_center_px"
-  new_valid_samples="$total_valid_samples"
-  new_axis_score="$axis_score"
-  new_y_corr_abs="$y_corr_abs"
-  new_y_cross_abs="$y_cross_abs"
-  new_v_span="$v_span"
+rows = []
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rows.append([float(x) for x in line.split(",")])
+
+if not rows:
+    raise SystemExit("no validation metrics rows")
+
+cols = list(zip(*rows))
+names = [
+    "new_hit_rate",
+    "new_dist_box",
+    "new_dist_center",
+    "new_axis_score",
+    "new_y_corr_abs",
+    "new_y_cross_abs",
+    "new_v_span",
+    "new_valid_samples",
+]
+for name, vals in zip(names, cols):
+    if name == "new_valid_samples":
+        print(f"{name}={int(round(statistics.median(vals)))}")
+    else:
+        print(f"{name}={statistics.median(vals):.6f}")
+PY
+    source "$agg_tmp"
+    rm -f "$agg_tmp" "$metrics_csv" "$validation_list_file"
+  fi
 
   gate_tmp="$(mktemp)"
   python3 - \
@@ -527,6 +586,7 @@ PY
           --log-file "$validation_used_file" \
           --codex-cmd "$codex_cmd" \
           --history-count "$history_count" \
+          --validation-runs "$validation_runs" \
           --auto-retry \
           --max-attempts "$max_attempts" \
           --attempt-index "$next_attempt"

@@ -126,6 +126,7 @@ def derive_mapper_settings(payload):
     grouped = []
     for it in payload["iterations"]:
         box = it["target_box"]
+        summary = it.get("summary", {})
         cx = (float(box["x1"]) + float(box["x2"])) * 0.5
         cy = (float(box["y1"]) + float(box["y2"])) * 0.5
         tx = float(np.clip(cx / max(sw - 1.0, 1.0), 0.0, 1.0))
@@ -153,13 +154,27 @@ def derive_mapper_settings(payload):
             keep_idx = np.arange(h_arr.size)
         h_keep = h_arr[keep_idx]
         v_keep = v_arr[keep_idx]
+        retry_index = int(it.get("retry_index", 0))
+        retry_queued = bool(summary.get("retry_queued", False))
+        h_std = summary.get("h_std")
+        v_std = summary.get("v_std")
+        h_std = float(h_std) if h_std is not None and np.isfinite(float(h_std)) else None
+        v_std = float(v_std) if v_std is not None and np.isfinite(float(v_std)) else None
+        attempt_quality = 1.0 / (1.0 + 0.35 * retry_index)
+        if retry_queued:
+            attempt_quality *= 0.60
+        if h_std is not None:
+            attempt_quality *= float(np.clip(TARGET_STD_MAX_H / max(h_std, 1e-4), 0.30, 1.20))
+        if v_std is not None:
+            attempt_quality *= float(np.clip(TARGET_STD_MAX_V / max(v_std, 1e-4), 0.30, 1.20))
+        attempt_quality = float(np.clip(attempt_quality, 0.10, 1.40))
         grouped.append(
             {
                 "tx": tx,
                 "ty": ty,
                 "h_med": float(np.median(h_keep)),
                 "v_med": float(np.median(v_keep)),
-                "w": float(max(1.0, keep_idx.size) / (1.0 + 5.0 * (h_mad + v_mad))),
+                "w": float(attempt_quality * max(1.0, keep_idx.size) / (1.0 + 5.0 * (h_mad + v_mad))),
             }
         )
     if len(grouped) < 6:
