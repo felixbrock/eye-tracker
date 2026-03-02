@@ -2,10 +2,14 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*$py.class
 
 .venv/
 venv/
 env/
+.env
+.env.*
+*.local
 
 .DS_Store
 
@@ -13,3 +17,36 @@ env/
 calibration_logs/
 calibration_logs/**
 
+# Distribution / packaging
+build/
+dist/
+site/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test / coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Type checker / linter caches
+.mypy_cache/
+.pyre/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python tooling
+.python-version
+__pypackages__/
