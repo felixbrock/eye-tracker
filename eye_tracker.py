@@ -85,16 +85,20 @@ MIN_DYNAMIC_SPAN_Y = 0.140
 MAX_DYNAMIC_SPAN_X = 0.42
 MAX_DYNAMIC_SPAN_Y = 0.46
 AUTO_BOUND_BLEND = 0.20
-AUTO_CENTER_BLEND = 0.16
-MAX_DYNAMIC_CENTER_SHIFT_X = 0.03
-MAX_DYNAMIC_CENTER_SHIFT_Y = 0.03
+AUTO_CENTER_BLEND = 0.10
+MAX_DYNAMIC_CENTER_SHIFT_X = 0.02
+MAX_DYNAMIC_CENTER_SHIFT_Y = 0.02
+DYNAMIC_CENTER_MIN_SAMPLES = 60
+DYNAMIC_CENTER_COVER_MARGIN_X = 0.05
+DYNAMIC_CENTER_COVER_MARGIN_Y = 0.05
 HEAD_ANCHOR_ALPHA = 0.035
 HEAD_ANCHOR_WARMUP_FRAMES = 12
 HEAD_ANCHOR_WARMUP_ALPHA = 0.30
-HEAD_ANCHOR_EDGE_ADAPT_FLOOR = 0.25
-RUNTIME_BIAS_UPDATE = 0.012
-RUNTIME_BIAS_MAX = 0.08
+HEAD_ANCHOR_EDGE_ADAPT_FLOOR = 0.45
+RUNTIME_BIAS_UPDATE = 0.008
+RUNTIME_BIAS_MAX = 0.06
 RUNTIME_BIAS_DECAY = 0.97
+RUNTIME_BIAS_MIN_SAMPLES = 90
 RUNTIME_BIAS_MIN_SPAN_X = 0.12
 RUNTIME_BIAS_MIN_SPAN_Y = 0.12
 RUNTIME_BIAS_CENTER_MARGIN_X = 0.08
@@ -220,6 +224,7 @@ class EyeTracker:
 
         ax, ay, ascale = self.head_anchor
         edge_blend = 0.0
+        head_motion = 0.0
         if apply_head_comp and self._head_anchor_warmup_left <= 0:
             # Clamp compensation inputs to prevent short head-motion spikes from
             # over-correcting gaze and collapsing usable vertical range.
@@ -238,6 +243,7 @@ class EyeTracker:
             y_comp *= comp_scale
             h -= x_comp
             v -= y_comp
+            head_motion = max(abs(dx_norm), abs(dy_norm), abs(dscale))
 
         # Keep anchor adaptive to slow posture changes while preserving
         # compensation against short-term head motion.
@@ -245,6 +251,8 @@ class EyeTracker:
             # Do not let prolonged off-center gaze rapidly absorb into the
             # anchor; that can decay compensation and cause drift away.
             adapt_scale = 1.0 - (1.0 - HEAD_ANCHOR_EDGE_ADAPT_FLOOR) * edge_blend
+            if head_motion > 0.08:
+                adapt_scale = max(adapt_scale, 0.70)
             a = HEAD_ANCHOR_ALPHA * adapt_scale
             self.head_anchor = (
                 (1.0 - a) * ax + a * hx,
@@ -458,20 +466,29 @@ class GazeMapper:
 
         x_mid = base_x_mid
         y_mid = base_y_mid
-        if h_obs_span >= MIN_DYNAMIC_CENTER_SPAN_X:
+        center_ready = len(self._range_h_hist) >= DYNAMIC_CENTER_MIN_SAMPLES
+        if center_ready and h_obs_span >= MIN_DYNAMIC_CENTER_SPAN_X:
             # Let center follow sustained user-specific neutral gaze with a
             # hard safety clamp so short glances do not drag the mapping.
-            h_mid = float((h_lo + h_hi) * 0.5)
-            x_shift = float(
-                np.clip(h_mid - base_x_mid, -MAX_DYNAMIC_CENTER_SHIFT_X, MAX_DYNAMIC_CENTER_SHIFT_X)
+            covered_both_x = h_lo <= (base_x_mid - DYNAMIC_CENTER_COVER_MARGIN_X) and h_hi >= (
+                base_x_mid + DYNAMIC_CENTER_COVER_MARGIN_X
             )
-            x_mid = float(base_x_mid + AUTO_CENTER_BLEND * x_shift)
-        if v_obs_span >= MIN_DYNAMIC_CENTER_SPAN_Y:
-            v_mid = float((v_lo + v_hi) * 0.5)
-            y_shift = float(
-                np.clip(v_mid - base_y_mid, -MAX_DYNAMIC_CENTER_SHIFT_Y, MAX_DYNAMIC_CENTER_SHIFT_Y)
+            if covered_both_x:
+                h_mid = float((h_lo + h_hi) * 0.5)
+                x_shift = float(
+                    np.clip(h_mid - base_x_mid, -MAX_DYNAMIC_CENTER_SHIFT_X, MAX_DYNAMIC_CENTER_SHIFT_X)
+                )
+                x_mid = float(base_x_mid + AUTO_CENTER_BLEND * x_shift)
+        if center_ready and v_obs_span >= MIN_DYNAMIC_CENTER_SPAN_Y:
+            covered_both_y = v_lo <= (base_y_mid - DYNAMIC_CENTER_COVER_MARGIN_Y) and v_hi >= (
+                base_y_mid + DYNAMIC_CENTER_COVER_MARGIN_Y
             )
-            y_mid = float(base_y_mid + AUTO_CENTER_BLEND * y_shift)
+            if covered_both_y:
+                v_mid = float((v_lo + v_hi) * 0.5)
+                y_shift = float(
+                    np.clip(v_mid - base_y_mid, -MAX_DYNAMIC_CENTER_SHIFT_Y, MAX_DYNAMIC_CENTER_SHIFT_Y)
+                )
+                y_mid = float(base_y_mid + AUTO_CENTER_BLEND * y_shift)
 
         x_min = x_mid - x_span * 0.5
         x_max = x_mid + x_span * 0.5
@@ -521,7 +538,7 @@ class GazeMapper:
         y = self._power_curve(y)
 
         self._norm_xy_hist.append((x, y))
-        if len(self._norm_xy_hist) >= 45:
+        if len(self._norm_xy_hist) >= RUNTIME_BIAS_MIN_SAMPLES:
             mx = float(np.mean([p[0] for p in self._norm_xy_hist]))
             my = float(np.mean([p[1] for p in self._norm_xy_hist]))
             sx_lo, sx_hi = np.percentile([p[0] for p in self._norm_xy_hist], [5, 95])
@@ -532,7 +549,7 @@ class GazeMapper:
             enough_y_span = span_y >= max(RUNTIME_BIAS_MIN_SPAN_Y, 2.0 * RUNTIME_BIAS_CENTER_MARGIN_Y)
             covered_both_x = sx_lo <= (0.5 - RUNTIME_BIAS_CENTER_MARGIN_X) and sx_hi >= (0.5 + RUNTIME_BIAS_CENTER_MARGIN_X)
             covered_both_y = sy_lo <= (0.5 - RUNTIME_BIAS_CENTER_MARGIN_Y) and sy_hi >= (0.5 + RUNTIME_BIAS_CENTER_MARGIN_Y)
-            if enough_x_span and covered_both_x and abs(0.5 - mx) > 0.08:
+            if enough_x_span and covered_both_x and abs(0.5 - mx) > 0.10:
                 self._runtime_x_bias = float(
                     np.clip(
                         self._runtime_x_bias + RUNTIME_BIAS_UPDATE * (0.5 - mx),
@@ -542,7 +559,7 @@ class GazeMapper:
                 )
             else:
                 self._runtime_x_bias *= RUNTIME_BIAS_DECAY
-            if enough_y_span and covered_both_y and abs(0.5 - my) > 0.08:
+            if enough_y_span and covered_both_y and abs(0.5 - my) > 0.10:
                 self._runtime_y_bias = float(
                     np.clip(
                         self._runtime_y_bias + RUNTIME_BIAS_UPDATE * (0.5 - my),
@@ -565,7 +582,7 @@ class GazeMapper:
             self._norm_x_lp = x
             self._norm_y_lp = y
         delta = float(np.hypot(x - self._norm_x_lp, y - self._norm_y_lp))
-        alpha = 0.80 if delta > 0.10 else 0.40
+        alpha = 0.85 if delta > 0.10 else 0.50
         self._norm_x_lp = (1.0 - alpha) * self._norm_x_lp + alpha * x
         self._norm_y_lp = (1.0 - alpha) * self._norm_y_lp + alpha * y
         x = self._norm_x_lp

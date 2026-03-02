@@ -27,15 +27,27 @@ ITERATION_SECONDS = 5.0
 TOTAL_ITERATIONS = 5
 BOX_W_RATIO = 0.14
 BOX_H_RATIO = 0.18
-BOX_MARGIN = 40
 OUT_DIR = "calibration_logs"
 
 
 def random_box(sw, sh, rng):
     bw = max(120, int(sw * BOX_W_RATIO))
     bh = max(120, int(sh * BOX_H_RATIO))
-    x1 = int(rng.integers(BOX_MARGIN, max(BOX_MARGIN + 1, sw - bw - BOX_MARGIN + 1)))
-    y1 = int(rng.integers(BOX_MARGIN, max(BOX_MARGIN + 1, sh - bh - BOX_MARGIN + 1)))
+
+    # Include strict edge placements (including corners) so calibration
+    # repeatedly exercises the full screen range, not only interior regions.
+    anchors_x = [0, max(0, (sw - bw) // 2), max(0, sw - bw)]
+    anchors_y = [0, max(0, (sh - bh) // 2), max(0, sh - bh)]
+    edge_boxes = [(ax, ay) for ay in anchors_y for ax in anchors_x]
+
+    # Use edge placements most of the time, with occasional random placements
+    # to avoid overfitting to a fixed grid.
+    if float(rng.random()) < 0.8:
+        x1, y1 = edge_boxes[int(rng.integers(0, len(edge_boxes)))]
+    else:
+        x1 = int(rng.integers(0, max(1, sw - bw + 1)))
+        y1 = int(rng.integers(0, max(1, sh - bh + 1)))
+
     return x1, y1, x1 + bw, y1 + bh
 
 
@@ -93,9 +105,15 @@ def main():
                 disp = np.zeros((sh, sw, 3), dtype=np.uint8)
 
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                # Center marker to provide an explicit fixation point.
+                cxi, cyi = int(round(cx)), int(round(cy))
+                marker_len = 18
+                cv2.line(disp, (cxi - marker_len, cyi), (cxi + marker_len, cyi), (255, 255, 255), 2)
+                cv2.line(disp, (cxi, cyi - marker_len), (cxi, cyi + marker_len), (255, 255, 255), 2)
+                cv2.circle(disp, (cxi, cyi), 6, (255, 255, 255), 2)
                 cv2.putText(
                     disp,
-                    "Move the eye-tracker cursor into the red box",
+                    "Move the eye-tracker cursor into the red box center",
                     (40, 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.95,
