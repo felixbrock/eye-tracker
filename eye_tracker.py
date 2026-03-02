@@ -91,11 +91,13 @@ MAX_DYNAMIC_CENTER_SHIFT_Y = 0.03
 HEAD_ANCHOR_ALPHA = 0.035
 HEAD_ANCHOR_WARMUP_FRAMES = 12
 HEAD_ANCHOR_WARMUP_ALPHA = 0.30
-RUNTIME_BIAS_UPDATE = 0.025
-RUNTIME_BIAS_MAX = 0.12
+RUNTIME_BIAS_UPDATE = 0.012
+RUNTIME_BIAS_MAX = 0.08
 RUNTIME_BIAS_DECAY = 0.97
 RUNTIME_BIAS_MIN_SPAN_X = 0.12
 RUNTIME_BIAS_MIN_SPAN_Y = 0.12
+RUNTIME_BIAS_CENTER_MARGIN_X = 0.08
+RUNTIME_BIAS_CENTER_MARGIN_Y = 0.08
 MIN_DYNAMIC_CENTER_SPAN_X = 0.100
 MIN_DYNAMIC_CENTER_SPAN_Y = 0.100
 OUTLIER_MEDIAN_GUARD = 0.18
@@ -521,9 +523,11 @@ class GazeMapper:
             sy_lo, sy_hi = np.percentile([p[1] for p in self._norm_xy_hist], [5, 95])
             span_x = float(sx_hi - sx_lo)
             span_y = float(sy_hi - sy_lo)
-            enough_x_span = span_x >= RUNTIME_BIAS_MIN_SPAN_X
-            enough_y_span = span_y >= RUNTIME_BIAS_MIN_SPAN_Y
-            if enough_x_span and abs(0.5 - mx) > 0.08:
+            enough_x_span = span_x >= max(RUNTIME_BIAS_MIN_SPAN_X, 2.0 * RUNTIME_BIAS_CENTER_MARGIN_X)
+            enough_y_span = span_y >= max(RUNTIME_BIAS_MIN_SPAN_Y, 2.0 * RUNTIME_BIAS_CENTER_MARGIN_Y)
+            covered_both_x = sx_lo <= (0.5 - RUNTIME_BIAS_CENTER_MARGIN_X) and sx_hi >= (0.5 + RUNTIME_BIAS_CENTER_MARGIN_X)
+            covered_both_y = sy_lo <= (0.5 - RUNTIME_BIAS_CENTER_MARGIN_Y) and sy_hi >= (0.5 + RUNTIME_BIAS_CENTER_MARGIN_Y)
+            if enough_x_span and covered_both_x and abs(0.5 - mx) > 0.08:
                 self._runtime_x_bias = float(
                     np.clip(
                         self._runtime_x_bias + RUNTIME_BIAS_UPDATE * (0.5 - mx),
@@ -533,7 +537,7 @@ class GazeMapper:
                 )
             else:
                 self._runtime_x_bias *= RUNTIME_BIAS_DECAY
-            if enough_y_span and abs(0.5 - my) > 0.08:
+            if enough_y_span and covered_both_y and abs(0.5 - my) > 0.08:
                 self._runtime_y_bias = float(
                     np.clip(
                         self._runtime_y_bias + RUNTIME_BIAS_UPDATE * (0.5 - my),
