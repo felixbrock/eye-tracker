@@ -284,8 +284,10 @@ class GazeMapper:
         # Default mapping bounds — tighter range since actual iris movement
         # within the eye is very small (typically ~0.45-0.55 across screen).
         # Optional persisted settings may refine these.
-        self.x_min = 0.42
-        self.x_max = 0.64
+        # Slightly recenter horizontal defaults to reduce persistent rightward
+        # bias observed in repeated calibration runs while preserving span.
+        self.x_min = 0.38
+        self.x_max = 0.60
         self.y_min = 0.40
         self.y_max = 0.60
         self.flip_x = True
@@ -689,8 +691,8 @@ class GazeMapper:
                 os.remove(tmp_path)
 
     def reset(self):
-        self.x_min = 0.42
-        self.x_max = 0.64
+        self.x_min = 0.38
+        self.x_max = 0.60
         self.y_min = 0.40
         self.y_max = 0.60
         self.flip_x = True
