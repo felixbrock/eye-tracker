@@ -160,3 +160,5 @@ git commit -m "run log tuning (${context_desc})" \
   -m "Log file: ${abs_log_file}"
 
 echo "Committed run-log changes with ${context_desc}."
+
+git push
