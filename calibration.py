@@ -187,7 +187,7 @@ def main():
     # on target-center distance during the run.
     probe_mappers = {}
     for flip_y in (False, True):
-        mapper = GazeMapper(sw, sh, load_saved_settings=False, calibration_mode=True)
+        mapper = GazeMapper(sw, sh, smoothing=1, load_saved_settings=False, calibration_mode=True)
         mapper.flip_y = flip_y
         probe_mappers[flip_y] = mapper
     active_flip_y = False

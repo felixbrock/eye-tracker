@@ -110,6 +110,10 @@ OUTLIER_EXTREME_LOW = 0.06
 OUTLIER_EXTREME_HIGH = 0.94
 FIXATION_DEADZONE_H = 0.0012
 FIXATION_DEADZONE_V = 0.0015
+CALIBRATION_SENSITIVITY_CAP_X = 1.25
+CALIBRATION_SENSITIVITY_CAP_Y = 1.35
+CALIBRATION_MAX_CURSOR_STEP_RATIO = 0.35
+CALIBRATION_DEADZONE_SCALE = 0.20
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -408,9 +412,14 @@ class GazeMapper:
         h = float(np.median(self._raw_h_hist))
         v = float(np.median(self._raw_v_hist))
         if self._last_h is not None:
-            if abs(h - self._last_h) < FIXATION_DEADZONE_H:
+            deadzone_h = FIXATION_DEADZONE_H
+            deadzone_v = FIXATION_DEADZONE_V
+            if self.calibration_mode:
+                deadzone_h *= CALIBRATION_DEADZONE_SCALE
+                deadzone_v *= CALIBRATION_DEADZONE_SCALE
+            if abs(h - self._last_h) < deadzone_h:
                 h = self._last_h
-            if abs(v - self._last_v) < FIXATION_DEADZONE_V:
+            if abs(v - self._last_v) < deadzone_v:
                 v = self._last_v
         self._last_h = h
         self._last_v = v
@@ -543,8 +552,16 @@ class GazeMapper:
         # Apply sensitivity: amplify deviation from center.
         # Calibration mode intentionally keeps this linear/low-gain to avoid
         # edge lock-in while collecting fitting samples.
-        sx = min(self.sensitivity_x, 1.0) if self.calibration_mode else self.sensitivity_x
-        sy = min(self.sensitivity_y, 1.0) if self.calibration_mode else self.sensitivity_y
+        sx = (
+            min(self.sensitivity_x, CALIBRATION_SENSITIVITY_CAP_X)
+            if self.calibration_mode
+            else self.sensitivity_x
+        )
+        sy = (
+            min(self.sensitivity_y, CALIBRATION_SENSITIVITY_CAP_Y)
+            if self.calibration_mode
+            else self.sensitivity_y
+        )
         x = 0.5 + (x - 0.5) * sx
         y = 0.5 + (y - 0.5) * sy
 
@@ -608,7 +625,10 @@ class GazeMapper:
             self._norm_x_lp = x
             self._norm_y_lp = y
         delta = float(np.hypot(x - self._norm_x_lp, y - self._norm_y_lp))
-        alpha = 0.85 if delta > 0.10 else 0.50
+        if self.calibration_mode:
+            alpha = 0.95 if delta > 0.10 else 0.72
+        else:
+            alpha = 0.85 if delta > 0.10 else 0.50
         self._norm_x_lp = (1.0 - alpha) * self._norm_x_lp + alpha * x
         self._norm_y_lp = (1.0 - alpha) * self._norm_y_lp + alpha * y
         x = self._norm_x_lp
@@ -623,7 +643,8 @@ class GazeMapper:
             dx = float(sx - prev_x)
             dy = float(sy - prev_y)
             step = float(np.hypot(dx, dy))
-            max_step_px = max(40.0, min(self.sw, self.sh) * MAX_CURSOR_STEP_RATIO)
+            step_ratio = CALIBRATION_MAX_CURSOR_STEP_RATIO if self.calibration_mode else MAX_CURSOR_STEP_RATIO
+            max_step_px = max(40.0, min(self.sw, self.sh) * step_ratio)
             if step > max_step_px:
                 scale = max_step_px / (step + 1e-7)
                 sx = int(round(prev_x + dx * scale))
