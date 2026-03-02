@@ -114,6 +114,8 @@ CALIBRATION_SENSITIVITY_CAP_X = 1.25
 CALIBRATION_SENSITIVITY_CAP_Y = 1.35
 CALIBRATION_MAX_CURSOR_STEP_RATIO = 0.35
 CALIBRATION_DEADZONE_SCALE = 0.20
+CALIBRATION_RAW_STEP_SCALE = 0.65
+CALIBRATION_MAD_LIMIT_SCALE = 0.75
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -394,6 +396,9 @@ class GazeMapper:
         if self._last_h is not None:
             max_step_h = 0.100
             max_step_v = 0.105
+            if self.calibration_mode:
+                max_step_h *= CALIBRATION_RAW_STEP_SCALE
+                max_step_v *= CALIBRATION_RAW_STEP_SCALE
             h = self._last_h + np.clip(h - self._last_h, -max_step_h, max_step_h)
             v = self._last_v + np.clip(v - self._last_v, -max_step_v, max_step_v)
         if self._raw_h_hist:
@@ -403,6 +408,9 @@ class GazeMapper:
             mad_v = float(np.median(np.abs(np.asarray(self._raw_v_hist) - med_v))) + 1e-4
             lim_h = 0.028 + 4.0 * mad_h
             lim_v = 0.030 + 4.0 * mad_v
+            if self.calibration_mode:
+                lim_h *= CALIBRATION_MAD_LIMIT_SCALE
+                lim_v *= CALIBRATION_MAD_LIMIT_SCALE
             h = med_h + float(np.clip(h - med_h, -lim_h, lim_h))
             v = med_v + float(np.clip(v - med_v, -lim_v, lim_v))
         h = float(np.clip(h, 0.0, 1.0))
@@ -527,7 +535,12 @@ class GazeMapper:
         self._range_h_hist.append(h)
         self._range_v_hist.append(v)
 
-        x_min, x_max, y_min, y_max = self._effective_bounds()
+        if self.calibration_mode:
+            # Keep calibration guidance deterministic so fitting data reflects
+            # stable mapper behavior rather than short-window adaptive drift.
+            x_min, x_max, y_min, y_max = self.x_min, self.x_max, self.y_min, self.y_max
+        else:
+            x_min, x_max, y_min, y_max = self._effective_bounds()
 
         # Normalize to 0-1 based on bounds
         x = (h - x_min) / (x_max - x_min + 1e-7)
@@ -535,7 +548,10 @@ class GazeMapper:
 
         # Expand tiny live iris spans so edge targets remain reachable even when
         # a user naturally has limited eye-lid aperture in one axis.
-        bx, by = self._auto_range_boost()
+        if self.calibration_mode:
+            bx, by = 1.0, 1.0
+        else:
+            bx, by = self._auto_range_boost()
         x = 0.5 + (x - 0.5) * bx
         y = 0.5 + (y - 0.5) * by
 

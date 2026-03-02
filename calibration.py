@@ -199,10 +199,12 @@ def main():
     all_iterations = []
 
     try:
+        # Keep a stable head anchor across the full run; resetting every
+        # iteration reintroduces warmup transients that skew sample quality.
+        tracker.reset_head_anchor()
         for iteration_index in range(1, TOTAL_ITERATIONS + 1):
             for mapper in probe_mappers.values():
                 mapper.clear_runtime_state(reset_bias=True)
-            tracker.reset_head_anchor()
             box = random_box(sw, sh, rng)
             x1, y1, x2, y2 = box
             cx = (x1 + x2) / 2.0
