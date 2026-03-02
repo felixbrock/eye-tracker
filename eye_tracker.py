@@ -111,7 +111,7 @@ OUTLIER_EXTREME_HIGH = 0.94
 FIXATION_DEADZONE_H = 0.0012
 FIXATION_DEADZONE_V = 0.0015
 CALIBRATION_SENSITIVITY_CAP_X = 1.35
-CALIBRATION_SENSITIVITY_CAP_Y = 1.50
+CALIBRATION_SENSITIVITY_CAP_Y = 1.65
 CALIBRATION_MAX_CURSOR_STEP_RATIO = 0.35
 CALIBRATION_DEADZONE_SCALE = 0.20
 CALIBRATION_RAW_STEP_SCALE = 0.65
@@ -119,6 +119,7 @@ CALIBRATION_MAD_LIMIT_SCALE = 0.75
 CALIBRATION_RANGE_MIN_SAMPLES = 18
 CALIBRATION_MAX_AUTO_RANGE_BOOST = 1.60
 CALIBRATION_SOFT_CLIP_STRENGTH = 1.60
+CALIBRATION_SOFT_CLIP_MAX_STRENGTH = 3.00
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -560,7 +561,8 @@ class GazeMapper:
         if self.calibration_mode:
             # Keep calibration behavior stable: lock a conservative boost
             # once enough samples are observed instead of continuously adapting.
-            if (not self._calibration_boost_locked) and len(self._range_h_hist) >= CALIBRATION_RANGE_MIN_SAMPLES:
+            lock_ready_samples = max(CALIBRATION_RANGE_MIN_SAMPLES, RANGE_MIN_SAMPLES)
+            if (not self._calibration_boost_locked) and len(self._range_h_hist) >= lock_ready_samples:
                 abx, aby = self._auto_range_boost()
                 self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
                 self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
@@ -600,8 +602,19 @@ class GazeMapper:
         if self.calibration_mode:
             # Keep calibration deterministic while avoiding prolonged edge
             # saturation that can poison fitted bounds.
-            x = self._soft_clip_unit(x, strength=CALIBRATION_SOFT_CLIP_STRENGTH)
-            y = self._soft_clip_unit(y, strength=CALIBRATION_SOFT_CLIP_STRENGTH)
+            # When observed gaze span is narrow, use a stronger clip curve
+            # (less center compression) so edge targets remain reachable.
+            clip_boost = max(self._calibration_boost_x, self._calibration_boost_y)
+            clip_strength = CALIBRATION_SOFT_CLIP_STRENGTH + 2.2 * (clip_boost - 1.0)
+            clip_strength = float(
+                np.clip(
+                    clip_strength,
+                    CALIBRATION_SOFT_CLIP_STRENGTH,
+                    CALIBRATION_SOFT_CLIP_MAX_STRENGTH,
+                )
+            )
+            x = self._soft_clip_unit(x, strength=clip_strength)
+            y = self._soft_clip_unit(y, strength=clip_strength)
         else:
             # Compress extremes before clipping so temporary outliers are less likely
             # to hard-pin the cursor to screen edges.
@@ -660,7 +673,7 @@ class GazeMapper:
             self._norm_y_lp = y
         delta = float(np.hypot(x - self._norm_x_lp, y - self._norm_y_lp))
         if self.calibration_mode:
-            alpha = 0.95 if delta > 0.10 else 0.72
+            alpha = 0.95 if delta > 0.10 else 0.80
         else:
             alpha = 0.85 if delta > 0.10 else 0.50
         self._norm_x_lp = (1.0 - alpha) * self._norm_x_lp + alpha * x
