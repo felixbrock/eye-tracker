@@ -6,6 +6,7 @@ Runs one 5-second trial with a random target box and logs cursor behavior.
 """
 
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -39,27 +40,42 @@ SPAN_MIN = 0.18
 SPAN_MAX = 0.55
 
 
-def _fit_axis_bounds(features, targets, force_flip=None):
+def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
     """Fit affine feature->target map and derive mapper bounds."""
     best = None
     flip_opts = [force_flip] if force_flip is not None else [False, True]
     x = np.asarray(features, dtype=float)
     t = np.asarray(targets, dtype=float)
+    w = None if weights is None else np.asarray(weights, dtype=float)
     if x.size < 16:
         return None
     if not np.isfinite(x).all() or not np.isfinite(t).all():
         return None
+    if w is not None:
+        if w.size != x.size or not np.isfinite(w).all():
+            return None
+        w = np.clip(w, 1e-6, None)
     for flip in flip_opts:
         # Mapper applies flip after normalization. Fit target in that space.
         y = 1.0 - t if flip else t
         A = np.column_stack([x, np.ones_like(x)])
-        coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
+        if w is None:
+            coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
+        else:
+            sw = np.sqrt(w)
+            Aw = A * sw[:, None]
+            yw = y * sw
+            coeff, *_ = np.linalg.lstsq(Aw, yw, rcond=None)
         a = float(coeff[0])
         b = float(coeff[1])
         if abs(a) < 1e-6:
             continue
         pred = a * x + b
-        mae = float(np.mean(np.abs(pred - y)))
+        abs_err = np.abs(pred - y)
+        if w is None:
+            mae = float(np.mean(abs_err))
+        else:
+            mae = float(np.sum(abs_err * w) / (np.sum(w) + 1e-7))
         p_lo, p_hi = np.percentile(x, [5, 95])
         span = float(np.clip(abs((1.0 - b) / a - (0.0 - b) / a), SPAN_MIN, SPAN_MAX))
         center = float(np.clip((p_lo + p_hi) * 0.5, BND_MIN, BND_MAX))
@@ -87,30 +103,49 @@ def _fit_axis_bounds(features, targets, force_flip=None):
 def derive_mapper_settings(payload):
     sw = float(payload["screen"]["width"])
     sh = float(payload["screen"]["height"])
+    screen_diag = max(1.0, float(math.hypot(sw, sh)))
     hs = []
     vs = []
     txs = []
     tys = []
+    ws = []
     for it in payload["iterations"]:
         box = it["target_box"]
         cx = (float(box["x1"]) + float(box["x2"])) * 0.5
         cy = (float(box["y1"]) + float(box["y2"])) * 0.5
         tx = float(np.clip(cx / max(sw - 1.0, 1.0), 0.0, 1.0))
         ty = float(np.clip(cy / max(sh - 1.0, 1.0), 0.0, 1.0))
-        for s in it["samples"]:
+        iter_samples = [
+            s
+            for s in it["samples"]
+            if np.isfinite(float(s["iris_h"])) and np.isfinite(float(s["iris_v"]))
+        ]
+        if not iter_samples:
+            continue
+        dists = np.asarray([float(s["distance_to_box_center_px"]) for s in iter_samples], dtype=float)
+        keep_threshold = float(np.percentile(dists, 40.0))
+        for s in iter_samples:
+            dist_center = float(s["distance_to_box_center_px"])
+            if len(iter_samples) >= 12 and dist_center > keep_threshold:
+                continue
             h = float(s["iris_h"])
             v = float(s["iris_v"])
-            if not (np.isfinite(h) and np.isfinite(v)):
-                continue
             hs.append(h)
             vs.append(v)
             txs.append(tx)
             tys.append(ty)
+            # Prefer samples that actually approached the target.
+            ws.append(1.0 / (1.0 + dist_center / (0.35 * screen_diag)))
     if len(hs) < 24:
         return None
 
-    fx = _fit_axis_bounds(hs, txs, force_flip=True)
-    fy = _fit_axis_bounds(vs, tys, force_flip=bool(payload.get("auto_flip_y_selected", False)))
+    fx = _fit_axis_bounds(hs, txs, force_flip=True, weights=ws)
+    fy = _fit_axis_bounds(
+        vs,
+        tys,
+        force_flip=bool(payload.get("auto_flip_y_selected", False)),
+        weights=ws,
+    )
     if fx is None or fy is None:
         return None
 

@@ -110,12 +110,14 @@ OUTLIER_EXTREME_LOW = 0.06
 OUTLIER_EXTREME_HIGH = 0.94
 FIXATION_DEADZONE_H = 0.0012
 FIXATION_DEADZONE_V = 0.0015
-CALIBRATION_SENSITIVITY_CAP_X = 1.25
-CALIBRATION_SENSITIVITY_CAP_Y = 1.35
+CALIBRATION_SENSITIVITY_CAP_X = 1.35
+CALIBRATION_SENSITIVITY_CAP_Y = 1.50
 CALIBRATION_MAX_CURSOR_STEP_RATIO = 0.35
 CALIBRATION_DEADZONE_SCALE = 0.20
 CALIBRATION_RAW_STEP_SCALE = 0.65
 CALIBRATION_MAD_LIMIT_SCALE = 0.75
+CALIBRATION_RANGE_MIN_SAMPLES = 18
+CALIBRATION_MAX_AUTO_RANGE_BOOST = 1.60
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -321,6 +323,9 @@ class GazeMapper:
         self._norm_y_lp = None
         self._last_h = None
         self._last_v = None
+        self._calibration_boost_x = 1.0
+        self._calibration_boost_y = 1.0
+        self._calibration_boost_locked = False
         if load_saved_settings:
             self._load()
 
@@ -447,6 +452,9 @@ class GazeMapper:
         self._norm_y_lp = None
         self._last_h = None
         self._last_v = None
+        self._calibration_boost_x = 1.0
+        self._calibration_boost_y = 1.0
+        self._calibration_boost_locked = False
 
     def _auto_range_boost(self):
         if len(self._range_h_hist) < RANGE_MIN_SAMPLES:
@@ -549,7 +557,14 @@ class GazeMapper:
         # Expand tiny live iris spans so edge targets remain reachable even when
         # a user naturally has limited eye-lid aperture in one axis.
         if self.calibration_mode:
-            bx, by = 1.0, 1.0
+            # Keep calibration behavior stable: lock a conservative boost
+            # once enough samples are observed instead of continuously adapting.
+            if (not self._calibration_boost_locked) and len(self._range_h_hist) >= CALIBRATION_RANGE_MIN_SAMPLES:
+                abx, aby = self._auto_range_boost()
+                self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
+                self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
+                self._calibration_boost_locked = True
+            bx, by = self._calibration_boost_x, self._calibration_boost_y
         else:
             bx, by = self._auto_range_boost()
         x = 0.5 + (x - 0.5) * bx
