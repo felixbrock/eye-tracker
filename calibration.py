@@ -202,6 +202,37 @@ def main():
         # Keep a stable head anchor across the full run; resetting every
         # iteration reintroduces warmup transients that skew sample quality.
         tracker.reset_head_anchor()
+        countdown_start = time.time()
+        countdown_secs = 3
+        while True:
+            remaining = countdown_secs - int(time.time() - countdown_start)
+            if remaining <= 0:
+                break
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                print("Cancelled.")
+                return
+            disp = np.zeros((sh, sw, 3), dtype=np.uint8)
+            cv2.putText(
+                disp,
+                f"Calibration starts in {remaining}",
+                (max(40, sw // 2 - 280), sh // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.5,
+                (255, 255, 255),
+                3,
+            )
+            cv2.putText(
+                disp,
+                "Look at the screen and keep your head still",
+                (max(40, sw // 2 - 340), sh // 2 + 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.95,
+                (210, 210, 210),
+                2,
+            )
+            cv2.imshow(win, disp)
+            cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         for iteration_index in range(1, TOTAL_ITERATIONS + 1):
             for mapper in probe_mappers.values():
                 mapper.clear_runtime_state(reset_bias=True)
