@@ -10,7 +10,8 @@ Description:
   Builds a prompt embedding the given log file and starts a new Codex CLI session
   to analyze poor eye-tracker performance and adjust the tracker logic accordingly.
   Then it validates performance using a post-change calibration run, applies
-  objective acceptance gates, and auto-rolls back changes on regression.
+  objective acceptance gates focused on calibration-data quality, and auto-rolls
+  back changes on regression.
   Passing runs are auto-committed with a context marker ("codex context" or
   "claude code context") in the commit message.
 
@@ -157,6 +158,8 @@ extract_metrics() {
   local out_file="$2"
   python3 - "$in_file" "$out_file" <<'PY'
 import json
+import math
+import statistics
 import sys
 
 in_file = sys.argv[1]
@@ -168,26 +171,77 @@ iters = payload.get("iterations", [])
 if not iters:
     raise SystemExit("no iterations found in calibration log")
 
+def corr(xs, ys):
+    if len(xs) < 2 or len(ys) < 2:
+        return 0.0
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 1e-12 or vy <= 1e-12:
+        return 0.0
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return cov / math.sqrt(vx * vy)
+
 hit_rates = []
 dist_box = []
 dist_center = []
 valid_total = 0
+quality_rejects = []
+point_tx = []
+point_ty = []
+point_h = []
+point_v = []
 for it in iters:
     s = it.get("summary", {})
     hit_rates.append(float(s.get("hit_rate", 0.0)))
     dist_box.append(float(s.get("mean_distance_to_box_px", 0.0)))
     dist_center.append(float(s.get("mean_distance_to_box_center_px", 0.0)))
     valid_total += int(s.get("valid_samples", 0))
+    quality_rejects.append(int(s.get("quality_rejects", 0)))
+    box = it.get("target_box", {})
+    samples = it.get("samples", [])
+    if samples and box:
+        cx = (float(box["x1"]) + float(box["x2"])) * 0.5
+        cy = (float(box["y1"]) + float(box["y2"])) * 0.5
+        tx = max(0.0, min(1.0, cx / max(float(payload["screen"]["width"]) - 1.0, 1.0)))
+        ty = max(0.0, min(1.0, cy / max(float(payload["screen"]["height"]) - 1.0, 1.0)))
+        hs = [float(x["iris_h"]) for x in samples if "iris_h" in x and "iris_v" in x]
+        vs = [float(x["iris_v"]) for x in samples if "iris_h" in x and "iris_v" in x]
+        if hs and vs:
+            point_tx.append(tx)
+            point_ty.append(ty)
+            point_h.append(float(statistics.median(hs)))
+            point_v.append(float(statistics.median(vs)))
 
 avg_hit = sum(hit_rates) / len(hit_rates)
 avg_box = sum(dist_box) / len(dist_box)
 avg_center = sum(dist_center) / len(dist_center)
+avg_quality_rejects = sum(quality_rejects) / len(quality_rejects)
+qr = payload.get("quality_report", {}) if isinstance(payload.get("quality_report"), dict) else {}
+x_corr_abs = float(qr.get("x_corr_abs", abs(corr(point_h, point_tx))))
+y_corr_abs = float(qr.get("y_corr_abs", abs(corr(point_v, point_ty))))
+x_cross_abs = float(qr.get("x_cross_abs", abs(corr(point_h, point_ty))))
+y_cross_abs = float(qr.get("y_cross_abs", abs(corr(point_v, point_tx))))
+axis_score = float(qr.get("axis_score", x_corr_abs + y_corr_abs - x_cross_abs - y_cross_abs))
+h_span = float(qr.get("h_span", (max(point_h) - min(point_h)) if point_h else 0.0))
+v_span = float(qr.get("v_span", (max(point_v) - min(point_v)) if point_v else 0.0))
+auto_flip_locked = bool(payload.get("auto_flip_y_locked", False))
 
 with open(out_file, "w", encoding="utf-8") as f:
     f.write(f"avg_hit_rate={avg_hit:.6f}\n")
     f.write(f"avg_dist_box_px={avg_box:.6f}\n")
     f.write(f"avg_dist_center_px={avg_center:.6f}\n")
     f.write(f"total_valid_samples={valid_total}\n")
+    f.write(f"avg_quality_rejects={avg_quality_rejects:.6f}\n")
+    f.write(f"x_corr_abs={x_corr_abs:.6f}\n")
+    f.write(f"y_corr_abs={y_corr_abs:.6f}\n")
+    f.write(f"x_cross_abs={x_cross_abs:.6f}\n")
+    f.write(f"y_cross_abs={y_cross_abs:.6f}\n")
+    f.write(f"axis_score={axis_score:.6f}\n")
+    f.write(f"h_span={h_span:.6f}\n")
+    f.write(f"v_span={v_span:.6f}\n")
+    f.write(f"auto_flip_locked={'true' if auto_flip_locked else 'false'}\n")
 PY
 }
 
@@ -214,7 +268,10 @@ restore_settings_file() {
 
 write_rejection_report() {
   local report_path="$1"
-  python3 - "$report_path" "$abs_log_file" "$validation_used_file" "$base_hit_rate" "$base_dist_box" "$base_dist_center" "$new_hit_rate" "$new_dist_box" "$new_dist_center" "$new_valid_samples" "$hard_fail_reasons" <<'PY'
+  python3 - "$report_path" "$abs_log_file" "$validation_used_file" \
+    "$base_hit_rate" "$base_dist_box" "$base_dist_center" "$base_axis_score" "$base_y_corr_abs" "$base_y_cross_abs" "$base_v_span" \
+    "$new_hit_rate" "$new_dist_box" "$new_dist_center" "$new_axis_score" "$new_y_corr_abs" "$new_y_cross_abs" "$new_v_span" "$new_valid_samples" \
+    "$hard_fail_reasons" <<'PY'
 import json
 import os
 import sys
@@ -227,9 +284,17 @@ from datetime import datetime, timezone
     base_hit,
     base_box,
     base_center,
+    base_axis_score,
+    base_y_corr,
+    base_y_cross,
+    base_v_span,
     new_hit,
     new_box,
     new_center,
+    new_axis_score,
+    new_y_corr,
+    new_y_cross,
+    new_v_span,
     new_valid,
     reasons,
 ) = sys.argv[1:]
@@ -243,11 +308,19 @@ payload = {
         "avg_hit_rate": float(base_hit),
         "avg_dist_box_px": float(base_box),
         "avg_dist_center_px": float(base_center),
+        "axis_score": float(base_axis_score),
+        "y_corr_abs": float(base_y_corr),
+        "y_cross_abs": float(base_y_cross),
+        "v_span": float(base_v_span),
     },
     "validation_metrics": {
         "avg_hit_rate": float(new_hit),
         "avg_dist_box_px": float(new_box),
         "avg_dist_center_px": float(new_center),
+        "axis_score": float(new_axis_score),
+        "y_corr_abs": float(new_y_corr),
+        "y_cross_abs": float(new_y_cross),
+        "v_span": float(new_v_span),
         "valid_samples": int(float(new_valid)),
     },
     "reasons": reasons,
@@ -264,6 +337,10 @@ base_hit_rate="$avg_hit_rate"
 base_dist_box="$avg_dist_box_px"
 base_dist_center="$avg_dist_center_px"
 base_valid_samples="$total_valid_samples"
+base_axis_score="$axis_score"
+base_y_corr_abs="$y_corr_abs"
+base_y_cross_abs="$y_cross_abs"
+base_v_span="$v_span"
 backup_settings_file
 
 # Capture recent commit intent/history so the tuning pass can avoid
@@ -300,6 +377,10 @@ Constraints:
   - baseline_avg_dist_to_box_px=${base_dist_box}
   - baseline_avg_dist_to_center_px=${base_dist_center}
   - baseline_valid_samples=${base_valid_samples}
+  - baseline_axis_score=${base_axis_score}
+  - baseline_y_corr_abs=${base_y_corr_abs}
+  - baseline_y_cross_abs=${base_y_cross_abs}
+  - baseline_v_span=${base_v_span}
 
 Relevant recent git history (newest first):
 EOF
@@ -365,54 +446,67 @@ else
   new_dist_box="$avg_dist_box_px"
   new_dist_center="$avg_dist_center_px"
   new_valid_samples="$total_valid_samples"
+  new_axis_score="$axis_score"
+  new_y_corr_abs="$y_corr_abs"
+  new_y_cross_abs="$y_cross_abs"
+  new_v_span="$v_span"
 
   gate_tmp="$(mktemp)"
-  python3 - "$base_hit_rate" "$base_dist_box" "$base_dist_center" "$new_hit_rate" "$new_dist_box" "$new_dist_center" "$new_valid_samples" <<'PY' > "$gate_tmp"
+  python3 - \
+    "$base_axis_score" "$base_y_corr_abs" "$base_y_cross_abs" "$base_v_span" \
+    "$new_axis_score" "$new_y_corr_abs" "$new_y_cross_abs" "$new_v_span" "$new_valid_samples" <<'PY' > "$gate_tmp"
 import sys
 
-base_hit = float(sys.argv[1])
-base_box = float(sys.argv[2])
-base_center = float(sys.argv[3])
-new_hit = float(sys.argv[4])
-new_box = float(sys.argv[5])
-new_center = float(sys.argv[6])
-new_valid = int(float(sys.argv[7]))
+base_axis = float(sys.argv[1])
+base_y_corr = float(sys.argv[2])
+base_y_cross = float(sys.argv[3])
+base_v_span = float(sys.argv[4])
+new_axis = float(sys.argv[5])
+new_y_corr = float(sys.argv[6])
+new_y_cross = float(sys.argv[7])
+new_v_span = float(sys.argv[8])
+new_valid = int(float(sys.argv[9]))
 
 hard_fail = []
-if new_valid < 120:
-    hard_fail.append(f"not enough validation samples ({new_valid} < 120)")
-if new_hit < base_hit - 0.03:
-    hard_fail.append(f"hit-rate regression too large ({new_hit:.3f} < {base_hit - 0.03:.3f})")
-if new_box > base_box * 1.08:
-    hard_fail.append(f"box-distance regression too large ({new_box:.1f} > {base_box * 1.08:.1f})")
-if new_center > base_center * 1.08:
-    hard_fail.append(f"center-distance regression too large ({new_center:.1f} > {base_center * 1.08:.1f})")
+if new_valid < 180:
+    hard_fail.append(f"not enough validation samples ({new_valid} < 180)")
+if new_axis < base_axis - 0.08:
+    hard_fail.append(f"axis-score regression too large ({new_axis:.3f} < {base_axis - 0.08:.3f})")
+if new_y_corr < base_y_corr - 0.08:
+    hard_fail.append(f"vertical-corr regression too large ({new_y_corr:.3f} < {base_y_corr - 0.08:.3f})")
+if new_y_cross > base_y_cross + 0.08:
+    hard_fail.append(f"vertical cross-axis leakage regression too large ({new_y_cross:.3f} > {base_y_cross + 0.08:.3f})")
+if new_v_span < base_v_span * 0.85:
+    hard_fail.append(f"vertical span regression too large ({new_v_span:.4f} < {base_v_span * 0.85:.4f})")
 
-hit_improved = (new_hit >= base_hit + 0.02) or (new_hit >= base_hit * 1.12)
-box_improved = (new_box <= base_box - 20.0) or (new_box <= base_box * 0.97)
-center_improved = (new_center <= base_center - 25.0) or (new_center <= base_center * 0.97)
-soft_pass = sum([hit_improved, box_improved, center_improved]) >= 2
+axis_improved = (new_axis >= base_axis + 0.05) or (new_axis >= base_axis * 1.08)
+y_corr_improved = (new_y_corr >= base_y_corr + 0.05) or (new_y_corr >= base_y_corr * 1.08)
+y_cross_improved = (new_y_cross <= base_y_cross - 0.05) or (new_y_cross <= base_y_cross * 0.90)
+v_span_improved = (new_v_span >= base_v_span + 0.01) or (new_v_span >= base_v_span * 1.10)
+soft_pass = sum([axis_improved, y_corr_improved, y_cross_improved, v_span_improved]) >= 2
 
 passed = (not hard_fail) and soft_pass
 print("passed=true" if passed else "passed=false")
-print(f"hit_improved={str(hit_improved).lower()}")
-print(f"box_improved={str(box_improved).lower()}")
-print(f"center_improved={str(center_improved).lower()}")
+print(f"axis_improved={str(axis_improved).lower()}")
+print(f"y_corr_improved={str(y_corr_improved).lower()}")
+print(f"y_cross_improved={str(y_cross_improved).lower()}")
+print(f"v_span_improved={str(v_span_improved).lower()}")
 if hard_fail:
     print("hard_fail_reasons=" + "; ".join(hard_fail))
 else:
     print("hard_fail_reasons=")
 PY
   passed="$(sed -n 's/^passed=//p' "$gate_tmp" | head -n 1)"
-  hit_improved="$(sed -n 's/^hit_improved=//p' "$gate_tmp" | head -n 1)"
-  box_improved="$(sed -n 's/^box_improved=//p' "$gate_tmp" | head -n 1)"
-  center_improved="$(sed -n 's/^center_improved=//p' "$gate_tmp" | head -n 1)"
+  axis_improved="$(sed -n 's/^axis_improved=//p' "$gate_tmp" | head -n 1)"
+  y_corr_improved="$(sed -n 's/^y_corr_improved=//p' "$gate_tmp" | head -n 1)"
+  y_cross_improved="$(sed -n 's/^y_cross_improved=//p' "$gate_tmp" | head -n 1)"
+  v_span_improved="$(sed -n 's/^v_span_improved=//p' "$gate_tmp" | head -n 1)"
   hard_fail_reasons="$(sed -n 's/^hard_fail_reasons=//p' "$gate_tmp" | head -n 1)"
   rm -f "$gate_tmp"
 
-  echo "Baseline metrics: hit_rate=${base_hit_rate}, dist_box_px=${base_dist_box}, dist_center_px=${base_dist_center}"
-  echo "Validation metrics: hit_rate=${new_hit_rate}, dist_box_px=${new_dist_box}, dist_center_px=${new_dist_center}, valid_samples=${new_valid_samples}"
-  echo "Gate checks: hit_improved=${hit_improved} box_improved=${box_improved} center_improved=${center_improved}"
+  echo "Baseline metrics: axis_score=${base_axis_score}, y_corr_abs=${base_y_corr_abs}, y_cross_abs=${base_y_cross_abs}, v_span=${base_v_span}"
+  echo "Validation metrics: axis_score=${new_axis_score}, y_corr_abs=${new_y_corr_abs}, y_cross_abs=${new_y_cross_abs}, v_span=${new_v_span}, valid_samples=${new_valid_samples}"
+  echo "Gate checks: axis_improved=${axis_improved} y_corr_improved=${y_corr_improved} y_cross_improved=${y_cross_improved} v_span_improved=${v_span_improved}"
   if [[ "$passed" != "true" ]]; then
     rollback_repo_changes
     restore_settings_file
@@ -455,7 +549,7 @@ git add -A
 git commit -m "run log tuning (${context_desc})" \
   -m "Context: ${context_desc}" \
   -m "Log file: ${abs_log_file}" \
-  -m "Baseline: hit_rate=${base_hit_rate} dist_box_px=${base_dist_box} dist_center_px=${base_dist_center}" \
+  -m "Baseline: axis_score=${base_axis_score} y_corr_abs=${base_y_corr_abs} y_cross_abs=${base_y_cross_abs} v_span=${base_v_span}" \
   -m "Validation: ${acceptance_note}"
 
 echo "Committed run-log changes with ${context_desc}."

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""
-Single-iteration eye-tracker calibration sampler.
+"""Eye-tracker calibration sampler and mapper fitter.
 
-Runs one 5-second trial with a random target box and logs cursor behavior.
+Collects deterministic multi-point fixation data and fits mapper bounds.
 """
 
 import json
-import math
 import os
 import time
 from datetime import datetime
@@ -18,6 +16,14 @@ from screeninfo import get_monitors
 from eye_tracker import (
     EyeTracker,
     GazeMapper,
+    L_BOTTOM,
+    L_INNER,
+    L_OUTER,
+    L_TOP,
+    R_BOTTOM,
+    R_INNER,
+    R_OUTER,
+    R_TOP,
     SETTINGS_FILE,
     SENSITIVITY_X,
     SENSITIVITY_Y,
@@ -27,9 +33,12 @@ from eye_tracker import (
 )
 
 
-ITERATION_SECONDS = 5.0
-TOTAL_ITERATIONS = 5
-ITERATION_SAMPLE_WARMUP_SECONDS = 0.40
+ITERATION_TIMEOUT_SECONDS = 7.0
+TARGET_DWELL_SECONDS = 0.35
+TARGET_CAPTURE_SECONDS = 1.20
+TARGET_SETTLE_SECONDS = 0.45
+STABLE_MIN_FRAMES = 8
+STABLE_MAX_IRIS_STEP = 0.020
 BOX_W_RATIO = 0.14
 BOX_H_RATIO = 0.18
 OUT_DIR = "calibration_logs"
@@ -41,28 +50,14 @@ BND_MIN = -0.20
 BND_MAX = 1.20
 SPAN_MIN = 0.18
 SPAN_MAX = 0.55
-FIT_KEEP_FRACTION = 0.35
-FIT_KEEP_MIN_SAMPLES = 18
-FIT_EDGE_MARGIN_PX = 1
-FIT_EDGE_REJECT_DIST_RATIO = 0.22
-GUIDE_OFFSET_ADAPT_GAIN = 0.025
-GUIDE_OFFSET_MAX = 0.25
-GUIDE_OFFSET_MIN = 0.08
-GUIDE_OFFSET_EDGE_EXCURSION = 0.30
-GUIDE_OFFSET_DECAY = 0.05
-GUIDE_OFFSET_STEP_MAX = 0.022
-GUIDE_OFFSET_CROSS_GAIN_BOOST = 1.9
-GUIDE_GAIN_MAX = 1.70
-GUIDE_GAIN_MIN = 0.85
-GUIDE_GAIN_ADAPT_X = 0.030
-GUIDE_GAIN_ADAPT_Y = 0.050
-GUIDE_GAIN_DECAY = 0.08
-GUIDE_MIN_TARGET_EXCURSION = 0.06
-GUIDE_UNDERREACH_MARGIN = 0.020
-GUIDE_OVERSHOOT_SCALE = 1.12
-GUIDE_CROSS_GAIN_ADAPT = 0.018
-FIT_ITER_WEIGHT_FLOOR = 0.25
-FIT_ITER_WEIGHT_HITRATE_GAIN = 0.75
+MIN_EYE_OPEN_RATIO = 0.075
+MAX_HEAD_MOTION_NORM = 0.23
+MAX_IRIS_STEP = 0.085
+FIT_AXIS_MIN_TARGETS = 3
+TARGET_MAX_RETRIES = 2
+TARGET_STD_MAX_H = 0.0065
+TARGET_STD_MAX_V = 0.0065
+TARGET_MIN_SAMPLES = 20
 
 
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
@@ -72,7 +67,7 @@ def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
     x = np.asarray(features, dtype=float)
     t = np.asarray(targets, dtype=float)
     w = None if weights is None else np.asarray(weights, dtype=float)
-    if x.size < 16:
+    if x.size < 3:
         return None
     if not np.isfinite(x).all() or not np.isfinite(t).all():
         return None
@@ -128,22 +123,9 @@ def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
 def derive_mapper_settings(payload):
     sw = float(payload["screen"]["width"])
     sh = float(payload["screen"]["height"])
-    screen_diag = max(1.0, float(math.hypot(sw, sh)))
-    hs = []
-    vs = []
-    txs = []
-    tys = []
-    ws = []
+    grouped = []
     for it in payload["iterations"]:
         box = it["target_box"]
-        hit_rate = float(it.get("summary", {}).get("hit_rate", 0.0))
-        iter_weight = float(
-            np.clip(
-                FIT_ITER_WEIGHT_FLOOR + FIT_ITER_WEIGHT_HITRATE_GAIN * hit_rate,
-                FIT_ITER_WEIGHT_FLOOR,
-                1.0,
-            )
-        )
         cx = (float(box["x1"]) + float(box["x2"])) * 0.5
         cy = (float(box["y1"]) + float(box["y2"])) * 0.5
         tx = float(np.clip(cx / max(sw - 1.0, 1.0), 0.0, 1.0))
@@ -153,46 +135,86 @@ def derive_mapper_settings(payload):
             for s in it["samples"]
             if np.isfinite(float(s["iris_h"])) and np.isfinite(float(s["iris_v"]))
         ]
-        if not iter_samples:
+        if len(iter_samples) < 8:
             continue
-        dists = np.asarray([float(s["distance_to_box_center_px"]) for s in iter_samples], dtype=float)
-        order = np.argsort(dists)
-        keep_n = int(max(FIT_KEEP_MIN_SAMPLES, round(len(iter_samples) * FIT_KEEP_FRACTION)))
-        keep_n = min(keep_n, len(iter_samples))
-        iter_weight_scale = 1.0 / float(max(keep_n, 1))
-        keep_indices = set(int(i) for i in order[:keep_n])
-        for i, s in enumerate(iter_samples):
-            if i not in keep_indices:
-                continue
-            dist_center = float(s["distance_to_box_center_px"])
-            sx = int(s["cursor_x"])
-            sy = int(s["cursor_y"])
-            edge_pinned = (
-                sx <= FIT_EDGE_MARGIN_PX
-                or sx >= int(sw) - 1 - FIT_EDGE_MARGIN_PX
-                or sy <= FIT_EDGE_MARGIN_PX
-                or sy >= int(sh) - 1 - FIT_EDGE_MARGIN_PX
-            )
-            if edge_pinned and dist_center > (FIT_EDGE_REJECT_DIST_RATIO * screen_diag):
-                continue
-            h = float(s["iris_h"])
-            v = float(s["iris_v"])
-            hs.append(h)
-            vs.append(v)
-            txs.append(tx)
-            tys.append(ty)
-            # Prefer samples that actually approached the target.
-            ws.append(iter_weight * iter_weight_scale / (1.0 + dist_center / (0.35 * screen_diag)))
-    if len(hs) < 24:
+
+        h_arr = np.asarray([float(s["iris_h"]) for s in iter_samples], dtype=float)
+        v_arr = np.asarray([float(s["iris_v"]) for s in iter_samples], dtype=float)
+        h_med = float(np.median(h_arr))
+        v_med = float(np.median(v_arr))
+        h_mad = float(np.median(np.abs(h_arr - h_med))) + 1e-4
+        v_mad = float(np.median(np.abs(v_arr - v_med))) + 1e-4
+        keep_mask = (
+            (np.abs(h_arr - h_med) <= (3.5 * h_mad + 0.008))
+            & (np.abs(v_arr - v_med) <= (3.5 * v_mad + 0.008))
+        )
+        keep_idx = np.where(keep_mask)[0]
+        if keep_idx.size < 6:
+            keep_idx = np.arange(h_arr.size)
+        h_keep = h_arr[keep_idx]
+        v_keep = v_arr[keep_idx]
+        grouped.append(
+            {
+                "tx": tx,
+                "ty": ty,
+                "h_med": float(np.median(h_keep)),
+                "v_med": float(np.median(v_keep)),
+                "w": float(max(1.0, keep_idx.size) / (1.0 + 5.0 * (h_mad + v_mad))),
+            }
+        )
+    if len(grouped) < 6:
         return None
 
-    fx = _fit_axis_bounds(hs, txs, force_flip=True, weights=ws)
-    fy = _fit_axis_bounds(
-        vs,
-        tys,
-        force_flip=bool(payload.get("auto_flip_y_selected", False)),
-        weights=ws,
-    )
+    x_groups = {}
+    y_groups = {}
+    for g in grouped:
+        x_groups.setdefault(round(g["tx"], 6), []).append(g)
+        y_groups.setdefault(round(g["ty"], 6), []).append(g)
+
+    if len(x_groups) < FIT_AXIS_MIN_TARGETS:
+        return None
+    if len(y_groups) < FIT_AXIS_MIN_TARGETS:
+        return None
+
+    hs = []
+    txs = []
+    wsx = []
+    for tx_key in sorted(x_groups.keys()):
+        gs = x_groups[tx_key]
+        hs.append(float(np.median([g["h_med"] for g in gs])))
+        txs.append(float(gs[0]["tx"]))
+        wsx.append(float(np.sum([g["w"] for g in gs])))
+
+    vs = []
+    tys = []
+    wsy = []
+    h_for_y = []
+    for ty_key in sorted(y_groups.keys()):
+        gs = y_groups[ty_key]
+        h_for_y.append(float(np.median([g["h_med"] for g in gs])))
+        vs.append(float(np.median([g["v_med"] for g in gs])))
+        tys.append(float(gs[0]["ty"]))
+        wsy.append(float(np.sum([g["w"] for g in gs])))
+
+    # Estimate vertical leakage from horizontal gaze and remove it before
+    # fitting vertical bounds. This helps users where eyelid/pose geometry
+    # makes v vary with x.
+    h_pts = np.asarray([g["h_med"] for g in grouped], dtype=float)
+    v_pts = np.asarray([g["v_med"] for g in grouped], dtype=float)
+    ty_pts = np.asarray([g["ty"] for g in grouped], dtype=float)
+    w_pts = np.asarray([g["w"] for g in grouped], dtype=float)
+    h_center = float(np.median(h_pts))
+    yx_coupling = 0.0
+    if len(grouped) >= 6:
+        A = np.column_stack([h_pts, ty_pts, np.ones_like(h_pts)])
+        sw = np.sqrt(np.clip(w_pts, 1e-6, None))
+        coeff, *_ = np.linalg.lstsq(A * sw[:, None], v_pts * sw, rcond=None)
+        yx_coupling = float(np.clip(coeff[0], -1.0, 1.0))
+        for i in range(len(vs)):
+            vs[i] = float(vs[i] - yx_coupling * (h_for_y[i] - h_center))
+
+    fx = _fit_axis_bounds(hs, txs, force_flip=None, weights=wsx)
+    fy = _fit_axis_bounds(vs, tys, force_flip=None, weights=wsy)
     if fx is None or fy is None:
         return None
 
@@ -209,6 +231,8 @@ def derive_mapper_settings(payload):
         "x_gain": 1.0,
         "y_offset": 0.0,
         "y_gain": 1.0,
+        "y_x_coupling": float(yx_coupling),
+        "y_x_center": float(h_center),
         "calibration_source_created_at": payload.get("created_at"),
     }
     return settings
@@ -224,25 +248,46 @@ def write_mapper_settings(settings):
     os.replace(tmp_path, SETTINGS_FILE)
 
 
-def random_box(sw, sh, rng):
+def calibration_targets(sw, sh):
     bw = max(120, int(sw * BOX_W_RATIO))
     bh = max(120, int(sh * BOX_H_RATIO))
 
-    # Include strict edge placements (including corners) so calibration
-    # repeatedly exercises the full screen range, not only interior regions.
     anchors_x = [0, max(0, (sw - bw) // 2), max(0, sw - bw)]
     anchors_y = [0, max(0, (sh - bh) // 2), max(0, sh - bh)]
-    edge_boxes = [(ax, ay) for ay in anchors_y for ax in anchors_x]
-
-    # Use edge placements most of the time, with occasional random placements
-    # to avoid overfitting to a fixed grid.
-    if float(rng.random()) < 0.8:
-        x1, y1 = edge_boxes[int(rng.integers(0, len(edge_boxes)))]
-    else:
-        x1 = int(rng.integers(0, max(1, sw - bw + 1)))
-        y1 = int(rng.integers(0, max(1, sh - bh + 1)))
-
-    return x1, y1, x1 + bw, y1 + bh
+    # Base 3x3 coverage phase.
+    grid_points = [
+        ("grid-center", 1, 1, "mixed"),
+        ("grid-top-left", 0, 0, "mixed"),
+        ("grid-top-right", 2, 0, "mixed"),
+        ("grid-bottom-right", 2, 2, "mixed"),
+        ("grid-bottom-left", 0, 2, "mixed"),
+        ("grid-top-center", 1, 0, "mixed"),
+        ("grid-right-center", 2, 1, "mixed"),
+        ("grid-bottom-center", 1, 2, "mixed"),
+        ("grid-left-center", 0, 1, "mixed"),
+    ]
+    # Dedicated vertical isolation phase on center column.
+    vertical_points = [
+        ("v-top-center-1", 1, 0, "vertical"),
+        ("v-mid-center-1", 1, 1, "vertical"),
+        ("v-bottom-center-1", 1, 2, "vertical"),
+        ("v-top-center-2", 1, 0, "vertical"),
+        ("v-mid-center-2", 1, 1, "vertical"),
+        ("v-bottom-center-2", 1, 2, "vertical"),
+    ]
+    targets = []
+    for name, ix, iy, phase in grid_points + vertical_points:
+        x1 = anchors_x[ix]
+        y1 = anchors_y[iy]
+        targets.append(
+            {
+                "name": name,
+                "phase": phase,
+                "retry_index": 0,
+                "target_box": (x1, y1, x1 + bw, y1 + bh),
+            }
+        )
+    return targets
 
 
 def distance_to_box(sx, sy, x1, y1, x2, y2):
@@ -251,55 +296,94 @@ def distance_to_box(sx, sy, x1, y1, x2, y2):
     return float(np.hypot(dx, dy))
 
 
-def _adapt_guide_gain(curr_gain, cursor_norm, target_norm, adapt_rate):
-    """Temporarily adapt per-iteration gain to reduce edge under-reach."""
-    target_centered = target_norm - 0.5
-    cursor_centered = cursor_norm - 0.5
-    target_mag = abs(target_centered)
-    cursor_mag = abs(cursor_centered)
-    same_side = target_centered * cursor_centered > 0.0
-
-    next_gain = curr_gain
-    if target_mag < GUIDE_MIN_TARGET_EXCURSION:
-        next_gain += (1.0 - curr_gain) * GUIDE_GAIN_DECAY
-    elif (not same_side) and cursor_mag > (0.5 * GUIDE_MIN_TARGET_EXCURSION):
-        # If the cursor is on the opposite side of center from target, add
-        # temporary gain so guidance can cross center instead of stalling.
-        next_gain += GUIDE_CROSS_GAIN_ADAPT * (target_mag + cursor_mag)
-    elif same_side and (cursor_mag + GUIDE_UNDERREACH_MARGIN) < target_mag:
-        next_gain += adapt_rate * (target_mag - cursor_mag)
-    elif cursor_mag > (target_mag * GUIDE_OVERSHOOT_SCALE):
-        next_gain += GUIDE_GAIN_DECAY * (1.0 - curr_gain)
-    else:
-        next_gain += GUIDE_GAIN_DECAY * (1.0 - curr_gain)
-    return float(np.clip(next_gain, GUIDE_GAIN_MIN, GUIDE_GAIN_MAX))
+def _eye_open_ratio(lm):
+    left_open = float(np.hypot(lm[L_BOTTOM].x - lm[L_TOP].x, lm[L_BOTTOM].y - lm[L_TOP].y))
+    right_open = float(np.hypot(lm[R_BOTTOM].x - lm[R_TOP].x, lm[R_BOTTOM].y - lm[R_TOP].y))
+    inter_eye = float(np.hypot(lm[L_OUTER].x - lm[R_OUTER].x, lm[L_OUTER].y - lm[R_OUTER].y))
+    return ((left_open + right_open) * 0.5) / (inter_eye + 1e-7)
 
 
-def _guide_offset_limit(target_norm):
-    """Scale temporary offset headroom by target eccentricity."""
-    excursion = abs(float(target_norm) - 0.5)
-    t = float(np.clip(excursion / GUIDE_OFFSET_EDGE_EXCURSION, 0.0, 1.0))
-    return float(GUIDE_OFFSET_MIN + (GUIDE_OFFSET_MAX - GUIDE_OFFSET_MIN) * t)
+def _head_motion_norm(head_state, anchor_state):
+    if anchor_state is None:
+        return 0.0
+    hx, hy, hs = head_state
+    ax, ay, a_scale = anchor_state
+    dx_norm = float((hx - ax) / (a_scale + 1e-7))
+    dy_norm = float((hy - ay) / (a_scale + 1e-7))
+    ds = float(np.log((hs + 1e-7) / (a_scale + 1e-7)))
+    return max(abs(dx_norm), abs(dy_norm), abs(ds))
 
 
-def _adapt_guide_offset(curr_off, err, cursor_norm, target_norm, max_off):
-    target_centered = float(target_norm) - 0.5
-    cursor_centered = float(cursor_norm) - 0.5
-    same_side = target_centered * cursor_centered > 0.0
-    gain = GUIDE_OFFSET_ADAPT_GAIN
-    if (not same_side) and abs(target_centered) >= GUIDE_MIN_TARGET_EXCURSION:
-        gain *= GUIDE_OFFSET_CROSS_GAIN_BOOST
+def _safe_corr(xs, ys):
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    if x.size < 2 or y.size != x.size:
+        return 0.0
+    x_std = float(np.std(x))
+    y_std = float(np.std(y))
+    if x_std < 1e-8 or y_std < 1e-8:
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])
 
-    desired = curr_off * (1.0 - GUIDE_OFFSET_DECAY) + gain * float(err)
-    delta = float(np.clip(desired - curr_off, -GUIDE_OFFSET_STEP_MAX, GUIDE_OFFSET_STEP_MAX))
-    next_off = curr_off + delta
-    return float(np.clip(next_off, -max_off, max_off))
+
+def build_quality_report(iterations, sw, sh):
+    point_tx = []
+    point_ty = []
+    point_h = []
+    point_v = []
+    per_target = []
+    for it in iterations:
+        box = it.get("target_box", {})
+        samples = it.get("samples", [])
+        if not box or not samples:
+            continue
+        hs = np.asarray([float(s["iris_h"]) for s in samples], dtype=float)
+        vs = np.asarray([float(s["iris_v"]) for s in samples], dtype=float)
+        if hs.size == 0 or vs.size == 0:
+            continue
+        cx = (float(box["x1"]) + float(box["x2"])) * 0.5
+        cy = (float(box["y1"]) + float(box["y2"])) * 0.5
+        tx = float(np.clip(cx / max(float(sw - 1), 1.0), 0.0, 1.0))
+        ty = float(np.clip(cy / max(float(sh - 1), 1.0), 0.0, 1.0))
+        point_tx.append(tx)
+        point_ty.append(ty)
+        point_h.append(float(np.median(hs)))
+        point_v.append(float(np.median(vs)))
+        per_target.append(
+            {
+                "name": it.get("target_name"),
+                "phase": it.get("phase"),
+                "retry_index": int(it.get("retry_index", 0)),
+                "samples": int(hs.size),
+                "h_std": float(np.std(hs)),
+                "v_std": float(np.std(vs)),
+            }
+        )
+
+    x_corr = abs(_safe_corr(point_h, point_tx))
+    y_corr = abs(_safe_corr(point_v, point_ty))
+    x_cross = abs(_safe_corr(point_h, point_ty))
+    y_cross = abs(_safe_corr(point_v, point_tx))
+    h_span = float((max(point_h) - min(point_h)) if point_h else 0.0)
+    v_span = float((max(point_v) - min(point_v)) if point_v else 0.0)
+    return {
+        "points_used": int(len(point_h)),
+        "x_corr_abs": float(x_corr),
+        "y_corr_abs": float(y_corr),
+        "x_cross_abs": float(x_cross),
+        "y_cross_abs": float(y_cross),
+        "axis_score": float(x_corr + y_corr - x_cross - y_cross),
+        "h_span": h_span,
+        "v_span": v_span,
+        "per_target": per_target,
+    }
 
 
 def main():
     monitor = get_monitors()[0]
     sw, sh = monitor.width, monitor.height
-    rng = np.random.default_rng()
+    target_queue = calibration_targets(sw, sh)
+    total_planned = len(target_queue)
 
     cap = cv2.VideoCapture(WEBCAM_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_W)
@@ -321,13 +405,10 @@ def main():
     flip_eval_samples = 0
     flip_eval_total_dist = {False: 0.0, True: 0.0}
     flip_eval_locked = False
-
     win = "Calibration Iteration"
     all_iterations = []
 
     try:
-        # Keep a stable head anchor across the full run; resetting every
-        # iteration reintroduces warmup transients that skew sample quality.
         tracker.reset_head_anchor()
         countdown_start = time.time()
         countdown_secs = 3
@@ -360,25 +441,32 @@ def main():
             )
             cv2.imshow(win, disp)
             cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        for iteration_index in range(1, TOTAL_ITERATIONS + 1):
+        iteration_index = 0
+        while target_queue:
+            target = target_queue.pop(0)
+            iteration_index += 1
+            box = target["target_box"]
+            prev_h = None
+            prev_v = None
             for mapper in probe_mappers.values():
                 mapper.clear_runtime_state(reset_bias=True)
-                # Per-iteration recenter of temporary guidance offsets keeps
-                # each target independent and prevents carry-over bias.
                 mapper.set_x_offset(0.0)
                 mapper.set_y_offset(0.0)
                 mapper.set_x_gain(1.0)
                 mapper.set_y_gain(1.0)
-            box = random_box(sw, sh, rng)
             x1, y1, x2, y2 = box
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             samples = []
+            rejected_quality = 0
+            settled_since = None
+            stable_frames = 0
+            capture_started_at = None
             t0 = time.time()
 
             while True:
                 elapsed = time.time() - t0
-                if elapsed >= ITERATION_SECONDS:
+                if elapsed >= ITERATION_TIMEOUT_SECONDS:
                     break
 
                 key = cv2.waitKey(1) & 0xFF
@@ -390,7 +478,9 @@ def main():
                 if not ret:
                     continue
 
-                result = tracker.process(frame, apply_head_comp=True)
+                # Capture raw gaze ratios for calibration fitting to avoid
+                # coupling compensation dynamics into the trained bounds.
+                result = tracker.process(frame, apply_head_comp=False, return_meta=True)
                 disp = np.zeros((sh, sw, 3), dtype=np.uint8)
 
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -411,7 +501,7 @@ def main():
                 )
                 cv2.putText(
                     disp,
-                    f"Iteration: {iteration_index}/{TOTAL_ITERATIONS}",
+                    f"Iteration: {iteration_index} (planned {total_planned}, queue {len(target_queue)})",
                     (40, 100),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.75,
@@ -420,7 +510,7 @@ def main():
                 )
                 cv2.putText(
                     disp,
-                    f"Time left: {max(0.0, ITERATION_SECONDS - elapsed):0.1f}s",
+                    f"Timeout in: {max(0.0, ITERATION_TIMEOUT_SECONDS - elapsed):0.1f}s",
                     (40, 135),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.75,
@@ -436,62 +526,44 @@ def main():
                     (160, 160, 160),
                     1,
                 )
+                cv2.putText(
+                    disp,
+                    f"Target: {target['name']} ({target['phase']}) retry {target['retry_index']}",
+                    (40, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.60,
+                    (185, 185, 185),
+                    2,
+                )
 
                 if result is not None:
-                    (h, v), _ = result
+                    (h, v), lm, head_state = result
+                    eye_open = _eye_open_ratio(lm)
+                    head_motion = _head_motion_norm(head_state, tracker.head_anchor)
+                    iris_step = 0.0
+                    if prev_h is not None and prev_v is not None:
+                        iris_step = float(np.hypot(h - prev_h, v - prev_v))
+                    prev_h = h
+                    prev_v = v
+                    quality_ok = (
+                        eye_open >= MIN_EYE_OPEN_RATIO
+                        and head_motion <= MAX_HEAD_MOTION_NORM
+                        and iris_step <= MAX_IRIS_STEP
+                    )
+                    stable_ok = (
+                        quality_ok
+                        and head_motion <= (0.85 * MAX_HEAD_MOTION_NORM)
+                        and iris_step <= STABLE_MAX_IRIS_STEP
+                    )
+
                     mapped_points = {}
                     center_dists = {}
-                    target_x_norm = float(cx / max(float(sw - 1), 1.0))
-                    target_y_norm = float(cy / max(float(sh - 1), 1.0))
-                    max_x_off = _guide_offset_limit(target_x_norm)
-                    max_y_off = _guide_offset_limit(target_y_norm)
                     for flip_y, mapper in probe_mappers.items():
                         sx_i, sy_i = mapper.map(h, v)
                         mapped_points[flip_y] = (sx_i, sy_i)
                         center_dists[flip_y] = float(np.hypot(sx_i - cx, sy_i - cy))
-                        # Calibration-only guidance assist: nudge temporary
-                        # offsets toward the current target center to reduce
-                        # gross bias/lag during sampling.
-                        err_x = (cx - float(sx_i)) / max(float(sw - 1), 1.0)
-                        err_y = (cy - float(sy_i)) / max(float(sh - 1), 1.0)
-                        cursor_x_norm = float(sx_i / max(float(sw - 1), 1.0))
-                        cursor_y_norm = float(sy_i / max(float(sh - 1), 1.0))
-                        mapper.set_x_offset(
-                            _adapt_guide_offset(
-                                mapper.x_offset,
-                                err_x,
-                                cursor_x_norm,
-                                target_x_norm,
-                                max_x_off,
-                            )
-                        )
-                        mapper.set_y_offset(
-                            _adapt_guide_offset(
-                                mapper.y_offset,
-                                err_y,
-                                cursor_y_norm,
-                                target_y_norm,
-                                max_y_off,
-                            )
-                        )
-                        mapper.set_x_gain(
-                            _adapt_guide_gain(
-                                mapper.x_gain,
-                                cursor_x_norm,
-                                target_x_norm,
-                                GUIDE_GAIN_ADAPT_X,
-                            )
-                        )
-                        mapper.set_y_gain(
-                            _adapt_guide_gain(
-                                mapper.y_gain,
-                                cursor_y_norm,
-                                target_y_norm,
-                                GUIDE_GAIN_ADAPT_Y,
-                            )
-                        )
 
-                    if not flip_eval_locked:
+                    if quality_ok and (not flip_eval_locked):
                         flip_eval_samples += 1
                         flip_eval_total_dist[False] += center_dists[False]
                         flip_eval_total_dist[True] += center_dists[True]
@@ -521,7 +593,28 @@ def main():
                     dist_box_px = distance_to_box(sx, sy, x1, y1, x2, y2)
                     dist_center_px = float(np.hypot(sx - cx, sy - cy))
 
-                    if elapsed >= ITERATION_SAMPLE_WARMUP_SECONDS:
+                    if quality_ok:
+                        if stable_ok:
+                            stable_frames += 1
+                            if settled_since is None:
+                                settled_since = elapsed
+                        else:
+                            stable_frames = 0
+                            settled_since = None
+                    else:
+                        stable_frames = 0
+                        settled_since = None
+
+                    if (
+                        capture_started_at is None
+                        and settled_since is not None
+                        and stable_frames >= STABLE_MIN_FRAMES
+                        and elapsed >= TARGET_SETTLE_SECONDS
+                        and (elapsed - settled_since) >= TARGET_DWELL_SECONDS
+                    ):
+                        capture_started_at = elapsed
+
+                    if capture_started_at is not None and quality_ok:
                         samples.append(
                             {
                                 "iteration_index": iteration_index,
@@ -533,8 +626,13 @@ def main():
                                 "inside_box": bool(inside),
                                 "distance_to_box_px": dist_box_px,
                                 "distance_to_box_center_px": dist_center_px,
+                                "eye_open_ratio": float(eye_open),
+                                "head_motion_norm": float(head_motion),
+                                "iris_step": float(iris_step),
                             }
                         )
+                    elif not quality_ok:
+                        rejected_quality += 1
 
                     color = (0, 220, 0) if inside else (0, 255, 255)
                     cv2.circle(disp, (int(sx), int(sy)), 10, color, -1)
@@ -547,12 +645,38 @@ def main():
                     cv2.putText(
                         disp,
                         f"Live hit-rate: {hit_rate * 100.0:0.1f}%",
-                        (40, 205),
+                        (40, 240),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.75,
                         (110, 245, 140),
                         2,
                     )
+                    phase = "seek fixation"
+                    if settled_since is not None:
+                        phase = "dwell"
+                    if capture_started_at is not None:
+                        phase = "capture"
+                    cv2.putText(
+                        disp,
+                        f"Phase: {phase}",
+                        (40, 275),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.72,
+                        (220, 220, 220),
+                        2,
+                    )
+                    cv2.putText(
+                        disp,
+                        f"Quality: {'OK' if quality_ok else 'REJECT'} stable={stable_frames}/{STABLE_MIN_FRAMES} eye={eye_open:.3f} head={head_motion:.3f}",
+                        (40, 310),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.56,
+                        (120, 240, 120) if quality_ok else (90, 150, 255),
+                        2,
+                    )
+
+                    if capture_started_at is not None and (elapsed - capture_started_at) >= TARGET_CAPTURE_SECONDS:
+                        break
 
                 cv2.imshow(win, disp)
                 cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -562,10 +686,29 @@ def main():
             hit_rate = float(inside_count) / float(valid) if valid else 0.0
             mean_dist_box = float(np.mean([s["distance_to_box_px"] for s in samples])) if samples else 0.0
             mean_dist_center = float(np.mean([s["distance_to_box_center_px"] for s in samples])) if samples else 0.0
+            h_std = float(np.std([s["iris_h"] for s in samples])) if samples else None
+            v_std = float(np.std([s["iris_v"] for s in samples])) if samples else None
+            needs_retry = (
+                (valid < TARGET_MIN_SAMPLES)
+                or (h_std is not None and h_std > TARGET_STD_MAX_H)
+                or (v_std is not None and v_std > TARGET_STD_MAX_V)
+            )
+            if needs_retry and int(target["retry_index"]) < TARGET_MAX_RETRIES:
+                retry_target = dict(target)
+                retry_target["retry_index"] = int(target["retry_index"]) + 1
+                target_queue.append(retry_target)
+                print(
+                    f"Queued retry for {target['name']} (retry {retry_target['retry_index']}) "
+                    f"because samples={valid} h_std={h_std if h_std is not None else float('nan'):.4f} "
+                    f"v_std={v_std if v_std is not None else float('nan'):.4f}"
+                )
 
             all_iterations.append(
                 {
                     "iteration_index": iteration_index,
+                    "target_name": target["name"],
+                    "phase": target["phase"],
+                    "retry_index": int(target["retry_index"]),
                     "target_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
                     "summary": {
                         "valid_samples": valid,
@@ -573,23 +716,38 @@ def main():
                         "hit_rate": hit_rate,
                         "mean_distance_to_box_px": mean_dist_box,
                         "mean_distance_to_box_center_px": mean_dist_center,
+                        "quality_rejects": int(rejected_quality),
+                        "capture_started": bool(capture_started_at is not None),
+                        "stable_min_frames": int(STABLE_MIN_FRAMES),
+                        "h_std": h_std,
+                        "v_std": v_std,
+                        "retry_queued": bool(needs_retry and int(target["retry_index"]) < TARGET_MAX_RETRIES),
                     },
                     "samples": samples,
                 }
             )
 
             print(
-                f"Iteration {iteration_index}/{TOTAL_ITERATIONS}: "
+                f"Iteration {iteration_index}: "
                 f"samples={valid} hit_rate={hit_rate:.3f} "
                 f"mean_dist_box_px={mean_dist_box:.1f} "
-                f"mean_dist_center_px={mean_dist_center:.1f}"
+                f"mean_dist_center_px={mean_dist_center:.1f} "
+                f"quality_rejects={rejected_quality} "
+                f"h_std={(h_std if h_std is not None else float('nan')):.4f} "
+                f"v_std={(v_std if v_std is not None else float('nan')):.4f}"
             )
 
+        quality_report = build_quality_report(all_iterations, sw, sh)
         payload = {
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "screen": {"width": sw, "height": sh},
-            "iteration_seconds": ITERATION_SECONDS,
-            "total_iterations": TOTAL_ITERATIONS,
+            "iteration_timeout_seconds": ITERATION_TIMEOUT_SECONDS,
+            "target_dwell_seconds": TARGET_DWELL_SECONDS,
+            "target_capture_seconds": TARGET_CAPTURE_SECONDS,
+            "target_settle_seconds": TARGET_SETTLE_SECONDS,
+            "stable_min_frames": STABLE_MIN_FRAMES,
+            "total_iterations_planned": total_planned,
+            "total_iterations_executed": len(all_iterations),
             "auto_flip_y_selected": active_flip_y,
             "auto_flip_y_locked": flip_eval_locked,
             "auto_flip_eval_samples": flip_eval_samples,
@@ -597,6 +755,7 @@ def main():
                 "flip_y_false": (flip_eval_total_dist[False] / float(flip_eval_samples)) if flip_eval_samples else None,
                 "flip_y_true": (flip_eval_total_dist[True] / float(flip_eval_samples)) if flip_eval_samples else None,
             },
+            "quality_report": quality_report,
             "iterations": all_iterations,
         }
 
@@ -620,7 +779,15 @@ def main():
             print("Calibration run completed, but not enough valid samples to fit mapper settings.")
 
         print(f"Saved calibration iteration data to: {out_path}")
-        print(f"Iterations saved: {TOTAL_ITERATIONS}")
+        print(
+            "Calibration quality report: "
+            f"axis_score={quality_report['axis_score']:.3f} "
+            f"x_corr={quality_report['x_corr_abs']:.3f} "
+            f"y_corr={quality_report['y_corr_abs']:.3f} "
+            f"y_cross={quality_report['y_cross_abs']:.3f} "
+            f"v_span={quality_report['v_span']:.4f}"
+        )
+        print(f"Iterations saved: {len(all_iterations)} (planned {total_planned})")
     finally:
         try:
             cv2.destroyWindow(win)
