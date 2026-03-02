@@ -58,6 +58,12 @@ TARGET_MAX_RETRIES = 2
 TARGET_STD_MAX_H = 0.0065
 TARGET_STD_MAX_V = 0.0065
 TARGET_MIN_SAMPLES = 20
+GUIDE_OFFSET_ADAPT_GAIN = 0.022
+GUIDE_OFFSET_DECAY = 0.06
+GUIDE_OFFSET_MIN = 0.07
+GUIDE_OFFSET_MAX = 0.24
+GUIDE_OFFSET_EDGE_EXCURSION = 0.30
+Y_FIT_VERTICAL_PHASE_WEIGHT = 1.30
 
 
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
@@ -172,6 +178,7 @@ def derive_mapper_settings(payload):
             {
                 "tx": tx,
                 "ty": ty,
+                "phase": it.get("phase", "mixed"),
                 "h_med": float(np.median(h_keep)),
                 "v_med": float(np.median(v_keep)),
                 "w": float(attempt_quality * max(1.0, keep_idx.size) / (1.0 + 5.0 * (h_mad + v_mad))),
@@ -200,33 +207,34 @@ def derive_mapper_settings(payload):
         txs.append(float(gs[0]["tx"]))
         wsx.append(float(np.sum([g["w"] for g in gs])))
 
+    # Estimate vertical leakage from horizontal gaze using within-row deltas so
+    # true vertical target position does not confound the coupling estimate.
+    h_center = float(np.median([g["h_med"] for g in grouped]))
+    yx_num = 0.0
+    yx_den = 0.0
+    for ty_key in sorted(y_groups.keys()):
+        gs = y_groups[ty_key]
+        if len(gs) < 3:
+            continue
+        h_row = np.asarray([g["h_med"] for g in gs], dtype=float)
+        v_row = np.asarray([g["v_med"] for g in gs], dtype=float)
+        w_row = np.asarray([g["w"] for g in gs], dtype=float)
+        h_row_c = h_row - float(np.average(h_row, weights=w_row))
+        v_row_c = v_row - float(np.average(v_row, weights=w_row))
+        yx_num += float(np.sum(w_row * h_row_c * v_row_c))
+        yx_den += float(np.sum(w_row * h_row_c * h_row_c))
+    yx_coupling = float(np.clip(yx_num / (yx_den + 1e-7), -1.2, 1.2))
+
+    # Fit vertical bounds against per-target corrected medians (not only 3
+    # row aggregates) and prefer dedicated vertical-phase targets.
     vs = []
     tys = []
     wsy = []
-    h_for_y = []
-    for ty_key in sorted(y_groups.keys()):
-        gs = y_groups[ty_key]
-        h_for_y.append(float(np.median([g["h_med"] for g in gs])))
-        vs.append(float(np.median([g["v_med"] for g in gs])))
-        tys.append(float(gs[0]["ty"]))
-        wsy.append(float(np.sum([g["w"] for g in gs])))
-
-    # Estimate vertical leakage from horizontal gaze and remove it before
-    # fitting vertical bounds. This helps users where eyelid/pose geometry
-    # makes v vary with x.
-    h_pts = np.asarray([g["h_med"] for g in grouped], dtype=float)
-    v_pts = np.asarray([g["v_med"] for g in grouped], dtype=float)
-    ty_pts = np.asarray([g["ty"] for g in grouped], dtype=float)
-    w_pts = np.asarray([g["w"] for g in grouped], dtype=float)
-    h_center = float(np.median(h_pts))
-    yx_coupling = 0.0
-    if len(grouped) >= 6:
-        A = np.column_stack([h_pts, ty_pts, np.ones_like(h_pts)])
-        sw = np.sqrt(np.clip(w_pts, 1e-6, None))
-        coeff, *_ = np.linalg.lstsq(A * sw[:, None], v_pts * sw, rcond=None)
-        yx_coupling = float(np.clip(coeff[0], -1.0, 1.0))
-        for i in range(len(vs)):
-            vs[i] = float(vs[i] - yx_coupling * (h_for_y[i] - h_center))
+    for g in grouped:
+        vs.append(float(g["v_med"] - yx_coupling * (g["h_med"] - h_center)))
+        tys.append(float(g["ty"]))
+        phase_mul = Y_FIT_VERTICAL_PHASE_WEIGHT if g.get("phase") == "vertical" else 1.0
+        wsy.append(float(g["w"] * phase_mul))
 
     fx = _fit_axis_bounds(hs, txs, force_flip=None, weights=wsx)
     fy = _fit_axis_bounds(vs, tys, force_flip=None, weights=wsy)
@@ -309,6 +317,12 @@ def distance_to_box(sx, sy, x1, y1, x2, y2):
     dx = max(x1 - sx, 0, sx - x2)
     dy = max(y1 - sy, 0, sy - y2)
     return float(np.hypot(dx, dy))
+
+
+def _guide_offset_limit(target_norm):
+    excursion = abs(float(target_norm) - 0.5)
+    t = float(np.clip(excursion / GUIDE_OFFSET_EDGE_EXCURSION, 0.0, 1.0))
+    return float(GUIDE_OFFSET_MIN + (GUIDE_OFFSET_MAX - GUIDE_OFFSET_MIN) * t)
 
 
 def _eye_open_ratio(lm):
@@ -572,10 +586,24 @@ def main():
 
                     mapped_points = {}
                     center_dists = {}
+                    target_x_norm = float(cx / max(float(sw - 1), 1.0))
+                    target_y_norm = float(cy / max(float(sh - 1), 1.0))
+                    max_x_off = _guide_offset_limit(target_x_norm)
+                    max_y_off = _guide_offset_limit(target_y_norm)
                     for flip_y, mapper in probe_mappers.items():
                         sx_i, sy_i = mapper.map(h, v)
                         mapped_points[flip_y] = (sx_i, sy_i)
                         center_dists[flip_y] = float(np.hypot(sx_i - cx, sy_i - cy))
+                        # Calibration-only guidance: keep temporary offsets
+                        # bounded and decaying so each target can be reached
+                        # without carrying large bias into the next one.
+                        if capture_started_at is None:
+                            err_x = (cx - float(sx_i)) / max(float(sw - 1), 1.0)
+                            err_y = (cy - float(sy_i)) / max(float(sh - 1), 1.0)
+                            next_x_off = mapper.x_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_x
+                            next_y_off = mapper.y_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_y
+                            mapper.set_x_offset(float(np.clip(next_x_off, -max_x_off, max_x_off)))
+                            mapper.set_y_offset(float(np.clip(next_y_off, -max_y_off, max_y_off)))
 
                     if quality_ok and (not flip_eval_locked):
                         flip_eval_samples += 1
