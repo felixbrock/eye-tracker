@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_codex_log_tuning.sh --log-file <path> [--validation-log-file <path>] [--codex-cmd <cmd>] [--history-count <n>] [--skip-validation] [--dry-run]
+  ./run_codex_log_tuning.sh --log-file <path> [--validation-log-file <path>] [--codex-cmd <cmd>] [--history-count <n>] [--skip-validation] [--auto-retry|--no-auto-retry] [--max-attempts <n>] [--dry-run]
 
 Description:
   Builds a prompt embedding the given log file and starts a new Codex CLI session
@@ -20,6 +20,9 @@ Options:
   --codex-cmd  Codex launcher command (default: codex)
   --history-count Number of recent relevant commits to include as context (default: 12)
   --skip-validation Skip performance gates and commit directly after syntax checks
+  --auto-retry Automatically retry with the new validation log as baseline after rejection (default: on)
+  --no-auto-retry Disable automatic retry after rejection
+  --max-attempts Maximum total attempts including the first run (0 = unlimited, default: 0)
   --dry-run    Print generated prompt and exit (do not launch Codex)
   -h, --help   Show this help
 EOF
@@ -31,6 +34,11 @@ codex_cmd="codex"
 history_count=12
 skip_validation=0
 dry_run=0
+auto_retry=1
+max_attempts=0
+attempt_index=1
+settings_file="${HOME}/.config/gaze_settings.json"
+tmp_settings_backup=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +66,26 @@ while [[ $# -gt 0 ]]; do
     --skip-validation)
       skip_validation=1
       shift
+      ;;
+    --auto-retry)
+      auto_retry=1
+      shift
+      ;;
+    --no-auto-retry)
+      auto_retry=0
+      shift
+      ;;
+    --max-attempts)
+      [[ $# -ge 2 ]] || { echo "ERROR: --max-attempts requires a value" >&2; exit 2; }
+      [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: --max-attempts must be a non-negative integer" >&2; exit 2; }
+      max_attempts="$2"
+      shift 2
+      ;;
+    --attempt-index)
+      [[ $# -ge 2 ]] || { echo "ERROR: --attempt-index requires a value" >&2; exit 2; }
+      [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: --attempt-index must be a non-negative integer" >&2; exit 2; }
+      attempt_index="$2"
+      shift 2
       ;;
     --dry-run)
       dry_run=1
@@ -95,6 +123,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo "ERROR: git working tree is not clean. Commit or stash existing changes first." >&2
   exit 1
 fi
+if [[ "$max_attempts" -gt 0 && "$attempt_index" -gt "$max_attempts" ]]; then
+  echo "ERROR: attempt index (${attempt_index}) exceeded max attempts (${max_attempts})." >&2
+  exit 1
+fi
 
 abs_log_file="$(realpath "$log_file")"
 if [[ -n "$validation_log_file" ]]; then
@@ -113,6 +145,9 @@ cleanup() {
   rm -f "$tmp_history"
   rm -f "$tmp_baseline"
   rm -f "$tmp_validation"
+  if [[ -n "${tmp_settings_backup:-}" ]]; then
+    rm -f "$tmp_settings_backup"
+  fi
 }
 trap cleanup EXIT
 
@@ -161,12 +196,74 @@ rollback_repo_changes() {
   git clean -fd -e calibration_logs/ -e calibration_logs/*
 }
 
+backup_settings_file() {
+  if [[ -f "$settings_file" ]]; then
+    tmp_settings_backup="$(mktemp)"
+    cp -f "$settings_file" "$tmp_settings_backup"
+  fi
+}
+
+restore_settings_file() {
+  if [[ -n "${tmp_settings_backup:-}" && -f "$tmp_settings_backup" ]]; then
+    mkdir -p "$(dirname "$settings_file")"
+    cp -f "$tmp_settings_backup" "$settings_file"
+    echo "Restored pre-run settings file: $settings_file"
+  fi
+}
+
+write_rejection_report() {
+  local report_path="$1"
+  python3 - "$report_path" "$abs_log_file" "$validation_used_file" "$base_hit_rate" "$base_dist_box" "$base_dist_center" "$new_hit_rate" "$new_dist_box" "$new_dist_center" "$new_valid_samples" "$hard_fail_reasons" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+(
+    report_path,
+    baseline_log,
+    validation_log,
+    base_hit,
+    base_box,
+    base_center,
+    new_hit,
+    new_box,
+    new_center,
+    new_valid,
+    reasons,
+) = sys.argv[1:]
+
+payload = {
+    "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "status": "rejected",
+    "baseline_log_file": baseline_log,
+    "validation_log_file": validation_log,
+    "baseline_metrics": {
+        "avg_hit_rate": float(base_hit),
+        "avg_dist_box_px": float(base_box),
+        "avg_dist_center_px": float(base_center),
+    },
+    "validation_metrics": {
+        "avg_hit_rate": float(new_hit),
+        "avg_dist_box_px": float(new_box),
+        "avg_dist_center_px": float(new_center),
+        "valid_samples": int(float(new_valid)),
+    },
+    "reasons": reasons,
+}
+os.makedirs(os.path.dirname(report_path), exist_ok=True)
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+PY
+}
+
 extract_metrics "$abs_log_file" "$tmp_baseline"
 source "$tmp_baseline"
 base_hit_rate="$avg_hit_rate"
 base_dist_box="$avg_dist_box_px"
 base_dist_center="$avg_dist_center_px"
 base_valid_samples="$total_valid_samples"
+backup_settings_file
 
 # Capture recent commit intent/history so the tuning pass can avoid
 # fighting earlier adjustments and build from prior rationale.
@@ -317,9 +414,29 @@ PY
   echo "Gate checks: hit_improved=${hit_improved} box_improved=${box_improved} center_improved=${center_improved}"
   if [[ "$passed" != "true" ]]; then
     rollback_repo_changes
+    restore_settings_file
+    reject_stamp="$(date +%Y%m%d_%H%M%S)"
+    reject_report="calibration_logs/rejections/rejected_${reject_stamp}.json"
+    write_rejection_report "$reject_report"
     echo "Tuning rejected by objective gates."
     if [[ -n "${hard_fail_reasons:-}" ]]; then
       echo "Reasons: ${hard_fail_reasons}"
+    fi
+    echo "Saved rejection report to: ${reject_report}"
+    echo "Next action baseline would be: ${validation_used_file}"
+    if [[ "$auto_retry" -eq 1 ]]; then
+      if [[ "$max_attempts" -eq 0 || "$attempt_index" -lt "$max_attempts" ]]; then
+        next_attempt=$((attempt_index + 1))
+        echo "Auto-retrying tuning (attempt ${next_attempt})..."
+        exec "$0" \
+          --log-file "$validation_used_file" \
+          --codex-cmd "$codex_cmd" \
+          --history-count "$history_count" \
+          --auto-retry \
+          --max-attempts "$max_attempts" \
+          --attempt-index "$next_attempt"
+      fi
+      echo "Auto-retry stopped: reached max attempts (${max_attempts})."
     fi
     exit 1
   fi
