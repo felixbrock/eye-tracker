@@ -129,6 +129,7 @@ if [[ "$max_attempts" -gt 0 && "$attempt_index" -gt "$max_attempts" ]]; then
 fi
 
 abs_log_file="$(realpath "$log_file")"
+script_path="$(realpath "$0")"
 if [[ -n "$validation_log_file" ]]; then
   abs_validation_log_file="$(realpath "$validation_log_file")"
 else
@@ -428,7 +429,7 @@ PY
       if [[ "$max_attempts" -eq 0 || "$attempt_index" -lt "$max_attempts" ]]; then
         next_attempt=$((attempt_index + 1))
         echo "Auto-retrying tuning (attempt ${next_attempt})..."
-        exec "$0" \
+        exec "$script_path" \
           --log-file "$validation_used_file" \
           --codex-cmd "$codex_cmd" \
           --history-count "$history_count" \
