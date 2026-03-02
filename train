@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+latest_log="$(ls -1t calibration_logs/*.json | head -n 1)"
+sh run_codex_log_tuning.sh --log-file "$latest_log" "$@"
