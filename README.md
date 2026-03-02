@@ -32,7 +32,6 @@ uv run python eye_tracker.py
 
 ## Controls
 
-- `c`: start 4-point calibration
 - `r`: reset calibration to defaults
 - `d`: toggle debug webcam window
 - `s` / `S`: sensitivity down/up
@@ -44,16 +43,21 @@ uv run python eye_tracker.py
 
 You should calibrate every time your camera position, seat position, or monitor setup changes.
 
-1. Start the app.
-2. Keep your head in a natural position and look at the screen center.
-3. Press `c` to begin calibration.
-4. Follow each red dot (top-left, top-right, bottom-left, bottom-right).
-5. Keep your eyes on each dot until collection finishes.
-6. Wait for `Calibration saved!` in terminal.
+1. Close the tracker app if it is running.
+2. Run calibration:
+   ```bash
+   uv run python calibration.py
+   ```
+3. Keep your head in a natural position and follow each red target box center.
+4. Wait for `Saved calibration iteration data` in terminal.
+5. Start the tracker:
+   ```bash
+   uv run python eye_tracker.py
+   ```
 
 Calibration values are stored at:
 
-- `~/.config/gaze_calibration.json`
+- `~/.config/gaze_settings.json`
 
 ## How to get accurate tracking
 
@@ -68,7 +72,7 @@ Calibration values are stored at:
 If gaze point is off:
 
 1. Press `r` to reset.
-2. Press `c` and recalibrate carefully.
+2. Re-run `uv run python calibration.py`.
 3. Adjust sensitivity (`s`/`S`) and smoothing (`+`/`-`).
 4. Confirm camera is not tilted and is centered.
 

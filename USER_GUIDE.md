@@ -14,15 +14,15 @@ uv run python eye_tracker.py
 
 ## Mandatory calibration flow
 
-1. Sit normally and look at center of screen.
-2. Press `c`.
-3. Look directly at each calibration dot until it completes:
-   - Top-left
-   - Top-right
-   - Bottom-left
-   - Bottom-right
-4. Keep your head mostly still during each point.
-5. Confirm you see `Calibration saved!`.
+1. Close the tracker app if it is running.
+2. Run:
+```bash
+uv run python calibration.py
+```
+3. Sit normally and look at each target box center as it appears.
+4. Keep your head mostly still during each iteration.
+5. Confirm terminal prints `Saved calibration iteration data`.
+6. Start the tracker with `uv run python eye_tracker.py`.
 
 ## After calibration
 
@@ -31,7 +31,7 @@ uv run python eye_tracker.py
 
 ## If tracking is inaccurate
 
-- Press `r` to reset and calibrate again with `c`.
+- Press `r` to reset and calibrate again with `uv run python calibration.py`.
 - Improve lighting on your face.
 - Recenter the webcam at top-middle of monitor.
 - Increase/decrease sensitivity with `S`/`s`.
@@ -39,7 +39,6 @@ uv run python eye_tracker.py
 
 ## Controls reference
 
-- `c` calibrate
 - `r` reset calibration
 - `d` toggle debug view
 - `s` / `S` sensitivity down/up

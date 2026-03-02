@@ -17,6 +17,9 @@ from screeninfo import get_monitors
 from eye_tracker import (
     EyeTracker,
     GazeMapper,
+    SETTINGS_FILE,
+    SENSITIVITY_X,
+    SENSITIVITY_Y,
     WEBCAM_H,
     WEBCAM_INDEX,
     WEBCAM_W,
@@ -30,6 +33,113 @@ BOX_H_RATIO = 0.18
 OUT_DIR = "calibration_logs"
 FLIP_EVAL_MIN_SAMPLES = 90
 FLIP_EVAL_REL_MARGIN = 0.06
+BND_MIN = -0.20
+BND_MAX = 1.20
+SPAN_MIN = 0.18
+SPAN_MAX = 0.55
+
+
+def _fit_axis_bounds(features, targets, force_flip=None):
+    """Fit affine feature->target map and derive mapper bounds."""
+    best = None
+    flip_opts = [force_flip] if force_flip is not None else [False, True]
+    x = np.asarray(features, dtype=float)
+    t = np.asarray(targets, dtype=float)
+    if x.size < 16:
+        return None
+    if not np.isfinite(x).all() or not np.isfinite(t).all():
+        return None
+    for flip in flip_opts:
+        # Mapper applies flip after normalization. Fit target in that space.
+        y = 1.0 - t if flip else t
+        A = np.column_stack([x, np.ones_like(x)])
+        coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
+        a = float(coeff[0])
+        b = float(coeff[1])
+        if abs(a) < 1e-6:
+            continue
+        pred = a * x + b
+        mae = float(np.mean(np.abs(pred - y)))
+        p_lo, p_hi = np.percentile(x, [5, 95])
+        span = float(np.clip(abs((1.0 - b) / a - (0.0 - b) / a), SPAN_MIN, SPAN_MAX))
+        center = float(np.clip((p_lo + p_hi) * 0.5, BND_MIN, BND_MAX))
+        x_min = center - span * 0.5
+        x_max = center + span * 0.5
+        if x_min > x_max:
+            x_min, x_max = x_max, x_min
+        # Small margin prevents center-fit from clipping edge samples.
+        margin = 0.04 * span
+        x_min = float(np.clip(x_min - margin, BND_MIN, BND_MAX))
+        x_max = float(np.clip(x_max + margin, BND_MIN, BND_MAX))
+        if x_max - x_min < SPAN_MIN:
+            continue
+        cand = {
+            "flip": bool(flip),
+            "min": x_min,
+            "max": x_max,
+            "mae": mae,
+        }
+        if best is None or cand["mae"] < best["mae"]:
+            best = cand
+    return best
+
+
+def derive_mapper_settings(payload):
+    sw = float(payload["screen"]["width"])
+    sh = float(payload["screen"]["height"])
+    hs = []
+    vs = []
+    txs = []
+    tys = []
+    for it in payload["iterations"]:
+        box = it["target_box"]
+        cx = (float(box["x1"]) + float(box["x2"])) * 0.5
+        cy = (float(box["y1"]) + float(box["y2"])) * 0.5
+        tx = float(np.clip(cx / max(sw - 1.0, 1.0), 0.0, 1.0))
+        ty = float(np.clip(cy / max(sh - 1.0, 1.0), 0.0, 1.0))
+        for s in it["samples"]:
+            h = float(s["iris_h"])
+            v = float(s["iris_v"])
+            if not (np.isfinite(h) and np.isfinite(v)):
+                continue
+            hs.append(h)
+            vs.append(v)
+            txs.append(tx)
+            tys.append(ty)
+    if len(hs) < 24:
+        return None
+
+    fx = _fit_axis_bounds(hs, txs, force_flip=True)
+    fy = _fit_axis_bounds(vs, tys, force_flip=bool(payload.get("auto_flip_y_selected", False)))
+    if fx is None or fy is None:
+        return None
+
+    settings = {
+        "x_min": fx["min"],
+        "x_max": fx["max"],
+        "y_min": fy["min"],
+        "y_max": fy["max"],
+        "sensitivity_x": float(SENSITIVITY_X),
+        "sensitivity_y": float(SENSITIVITY_Y),
+        "flip_x": bool(fx["flip"]),
+        "flip_y": bool(fy["flip"]),
+        "x_offset": 0.0,
+        "x_gain": 1.0,
+        "y_offset": 0.0,
+        "y_gain": 1.0,
+        "calibration_source_created_at": payload.get("created_at"),
+    }
+    return settings
+
+
+def write_mapper_settings(settings):
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    tmp_path = SETTINGS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, SETTINGS_FILE)
 
 
 def random_box(sw, sh, rng):
@@ -272,6 +382,19 @@ def main():
         out_path = os.path.join(OUT_DIR, f"iteration_{stamp}.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+
+        fitted_settings = derive_mapper_settings(payload)
+        if fitted_settings is not None:
+            write_mapper_settings(fitted_settings)
+            print(f"Saved calibrated mapper settings to: {SETTINGS_FILE}")
+            print(
+                "Calibrated bounds "
+                f"x=[{fitted_settings['x_min']:.3f}, {fitted_settings['x_max']:.3f}] "
+                f"y=[{fitted_settings['y_min']:.3f}, {fitted_settings['y_max']:.3f}] "
+                f"flip_x={fitted_settings['flip_x']} flip_y={fitted_settings['flip_y']}"
+            )
+        else:
+            print("Calibration run completed, but not enough valid samples to fit mapper settings.")
 
         print(f"Saved calibration iteration data to: {out_path}")
         print(f"Iterations saved: {TOTAL_ITERATIONS}")
