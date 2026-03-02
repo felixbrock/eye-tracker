@@ -42,6 +42,8 @@ FIT_KEEP_FRACTION = 0.35
 FIT_KEEP_MIN_SAMPLES = 18
 FIT_EDGE_MARGIN_PX = 1
 FIT_EDGE_REJECT_DIST_RATIO = 0.22
+GUIDE_OFFSET_ADAPT_GAIN = 0.025
+GUIDE_OFFSET_MAX = 0.25
 
 
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
@@ -289,6 +291,10 @@ def main():
         for iteration_index in range(1, TOTAL_ITERATIONS + 1):
             for mapper in probe_mappers.values():
                 mapper.clear_runtime_state(reset_bias=True)
+                # Per-iteration recenter of temporary guidance offsets keeps
+                # each target independent and prevents carry-over bias.
+                mapper.set_x_offset(0.0)
+                mapper.set_y_offset(0.0)
             box = random_box(sw, sh, rng)
             x1, y1, x2, y2 = box
             cx = (x1 + x2) / 2.0
@@ -365,6 +371,15 @@ def main():
                         sx_i, sy_i = mapper.map(h, v)
                         mapped_points[flip_y] = (sx_i, sy_i)
                         center_dists[flip_y] = float(np.hypot(sx_i - cx, sy_i - cy))
+                        # Calibration-only guidance assist: nudge temporary
+                        # offsets toward the current target center to reduce
+                        # gross bias/lag during sampling.
+                        err_x = (cx - float(sx_i)) / max(float(sw - 1), 1.0)
+                        err_y = (cy - float(sy_i)) / max(float(sh - 1), 1.0)
+                        next_x_off = mapper.x_offset + GUIDE_OFFSET_ADAPT_GAIN * err_x
+                        next_y_off = mapper.y_offset + GUIDE_OFFSET_ADAPT_GAIN * err_y
+                        mapper.set_x_offset(float(np.clip(next_x_off, -GUIDE_OFFSET_MAX, GUIDE_OFFSET_MAX)))
+                        mapper.set_y_offset(float(np.clip(next_y_off, -GUIDE_OFFSET_MAX, GUIDE_OFFSET_MAX)))
 
                     if not flip_eval_locked:
                         flip_eval_samples += 1
@@ -384,11 +399,10 @@ def main():
                                     f"(mean center distance false={mean_false:.1f}, true={mean_true:.1f})"
                                 )
 
-                    selected_flip_y = active_flip_y
-                    if not flip_eval_locked:
-                        # Before lock, use whichever polarity is currently closer
-                        # to target center for better live guidance.
-                        selected_flip_y = center_dists[True] < center_dists[False]
+                    # Always use whichever polarity is currently closer to the
+                    # target for guidance. We still keep lock/eval stats for
+                    # selecting persisted flip_y at the end.
+                    selected_flip_y = center_dists[True] < center_dists[False]
 
                     sx, sy = mapped_points[selected_flip_y]
                     inside = x1 <= sx <= x2 and y1 <= sy <= y2
