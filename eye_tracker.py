@@ -128,6 +128,8 @@ CALIBRATION_DYNAMIC_COUPLING_MIN_H_SPAN = 0.050
 CALIBRATION_DYNAMIC_COUPLING_MAX_ABS = 0.35
 CALIBRATION_DYNAMIC_COUPLING_ALPHA = 0.08
 CALIBRATION_DYNAMIC_CENTER_ALPHA = 0.08
+CALIBRATION_COUPLING_LOCK_MIN_SAMPLES = 72
+CALIBRATION_COUPLING_LOCK_MIN_H_SPAN = 0.12
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -486,8 +488,17 @@ class GazeMapper:
         self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_locked = True
-        # Keep coupling stable once capture starts so samples are comparable
-        # within and across targets during a single calibration run.
+
+    def _maybe_lock_calibration_coupling(self):
+        """Freeze dynamic coupling only after enough horizontal coverage exists."""
+        if self._calibration_coupling_locked or (not self.calibration_mode):
+            return
+        if len(self._calib_coupling_h_hist) < CALIBRATION_COUPLING_LOCK_MIN_SAMPLES:
+            return
+        hs = np.asarray(self._calib_coupling_h_hist, dtype=float)
+        h_lo, h_hi = np.percentile(hs, [5, 95])
+        if float(h_hi - h_lo) < CALIBRATION_COUPLING_LOCK_MIN_H_SPAN:
+            return
         self._calibration_coupling_locked = True
 
     def _estimate_calibration_yx_coupling(self):
@@ -634,6 +645,7 @@ class GazeMapper:
         dynamic_yx_center = self.y_x_center
         if self.calibration_mode:
             dynamic_yx_coupling, dynamic_yx_center = self._estimate_calibration_yx_coupling()
+            self._maybe_lock_calibration_coupling()
         total_yx_coupling = self.y_x_coupling + dynamic_yx_coupling
         yx_center = dynamic_yx_center if self.calibration_mode else self.y_x_center
         if abs(total_yx_coupling) > 1e-7:

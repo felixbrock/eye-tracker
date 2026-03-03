@@ -399,6 +399,24 @@ def _safe_corr(xs, ys):
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _estimate_yx_coupling(point_h, point_v, point_ty):
+    groups = {}
+    for h, v, ty in zip(point_h, point_v, point_ty):
+        groups.setdefault(round(float(ty), 6), []).append((float(h), float(v)))
+    yx_num = 0.0
+    yx_den = 0.0
+    for row in groups.values():
+        if len(row) < 3:
+            continue
+        h_row = np.asarray([p[0] for p in row], dtype=float)
+        v_row = np.asarray([p[1] for p in row], dtype=float)
+        h_row_c = h_row - float(np.mean(h_row))
+        v_row_c = v_row - float(np.mean(v_row))
+        yx_num += float(np.sum(h_row_c * v_row_c))
+        yx_den += float(np.sum(h_row_c * h_row_c))
+    return float(np.clip(yx_num / (yx_den + 1e-7), -1.2, 1.2))
+
+
 def build_quality_report(iterations, sw, sh):
     point_tx = []
     point_ty = []
@@ -434,17 +452,25 @@ def build_quality_report(iterations, sw, sh):
         )
 
     x_corr = abs(_safe_corr(point_h, point_tx))
-    y_corr = abs(_safe_corr(point_v, point_ty))
+    y_corr_raw = abs(_safe_corr(point_v, point_ty))
     x_cross = abs(_safe_corr(point_h, point_ty))
-    y_cross = abs(_safe_corr(point_v, point_tx))
+    y_cross_raw = abs(_safe_corr(point_v, point_tx))
+    yx_coupling = _estimate_yx_coupling(point_h, point_v, point_ty)
+    h_center = float(np.median(point_h)) if point_h else 0.5
+    point_v_decoupled = [float(v - yx_coupling * (h - h_center)) for h, v in zip(point_h, point_v)]
+    y_corr = abs(_safe_corr(point_v_decoupled, point_ty))
+    y_cross = abs(_safe_corr(point_v_decoupled, point_tx))
     h_span = float((max(point_h) - min(point_h)) if point_h else 0.0)
     v_span = float((max(point_v) - min(point_v)) if point_v else 0.0)
     return {
         "points_used": int(len(point_h)),
         "x_corr_abs": float(x_corr),
         "y_corr_abs": float(y_corr),
+        "y_corr_raw_abs": float(y_corr_raw),
         "x_cross_abs": float(x_cross),
         "y_cross_abs": float(y_cross),
+        "y_cross_raw_abs": float(y_cross_raw),
+        "y_x_coupling_est": float(yx_coupling),
         "axis_score": float(x_corr + y_corr - x_cross - y_cross),
         "h_span": h_span,
         "v_span": v_span,
