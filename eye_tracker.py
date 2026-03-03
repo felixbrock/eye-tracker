@@ -118,6 +118,8 @@ CALIBRATION_RAW_STEP_SCALE = 0.78
 CALIBRATION_MAD_LIMIT_SCALE = 0.82
 CALIBRATION_RANGE_MIN_SAMPLES = 18
 CALIBRATION_MAX_AUTO_RANGE_BOOST = 1.60
+CALIBRATION_TARGET_IRIS_SPAN_X = 0.12
+CALIBRATION_TARGET_IRIS_SPAN_Y = 0.15
 CALIBRATION_BOOST_ALPHA = 0.22
 CALIBRATION_SOFT_CLIP_STRENGTH = 1.60
 CALIBRATION_SOFT_CLIP_MAX_STRENGTH = 3.00
@@ -545,10 +547,16 @@ class GazeMapper:
         v_lo, v_hi = np.percentile(vs, [10, 90])
         h_span = max(1e-4, float(h_hi - h_lo))
         v_span = max(1e-4, float(v_hi - v_lo))
+        if self.calibration_mode:
+            target_span_x = CALIBRATION_TARGET_IRIS_SPAN_X
+            target_span_y = CALIBRATION_TARGET_IRIS_SPAN_Y
+        else:
+            target_span_x = TARGET_IRIS_SPAN_X
+            target_span_y = TARGET_IRIS_SPAN_Y
         # Only expand low-amplitude ranges here; avoid automatic shrink that can
         # make edge reach worse on users with already narrow iris motion.
-        bx = float(np.clip(TARGET_IRIS_SPAN_X / h_span, 1.0, MAX_AUTO_RANGE_BOOST))
-        by = float(np.clip(TARGET_IRIS_SPAN_Y / v_span, 1.0, MAX_AUTO_RANGE_BOOST))
+        bx = float(np.clip(target_span_x / h_span, 1.0, MAX_AUTO_RANGE_BOOST))
+        by = float(np.clip(target_span_y / v_span, 1.0, MAX_AUTO_RANGE_BOOST))
         return bx, by
 
     def _effective_bounds(self):

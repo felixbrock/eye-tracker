@@ -58,15 +58,20 @@ TARGET_MAX_RETRIES = 2
 TARGET_STD_MAX_H = 0.0065
 TARGET_STD_MAX_V = 0.0065
 TARGET_MIN_SAMPLES = 20
-GUIDE_OFFSET_ADAPT_GAIN = 0.030
-GUIDE_OFFSET_DECAY = 0.06
-GUIDE_OFFSET_MIN = 0.07
-GUIDE_OFFSET_MAX = 0.34
+GUIDE_OFFSET_ADAPT_GAIN = 0.040
+GUIDE_OFFSET_DECAY = 0.045
+GUIDE_OFFSET_MIN = 0.12
+GUIDE_OFFSET_MAX = 0.40
 GUIDE_OFFSET_EDGE_EXCURSION = 0.30
 GUIDE_OFFSET_MIN_EFFECTIVE = 0.05
 GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MAX = 1.45
-GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE = 0.55
+GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE = 0.70
 GUIDE_OFFSET_VERTICAL_PHASE_Y_SCALE = 1.10
+GUIDE_OFFSET_CENTER_FLOOR_X = 0.20
+GUIDE_OFFSET_CENTER_FLOOR_Y = 0.18
+GUIDE_OFFSET_VERTICAL_PHASE_X_FLOOR = 0.14
+GUIDE_OFFSET_ERR_GAIN_SCALE = 0.80
+GUIDE_OFFSET_ERR_GAIN_REF = 0.22
 Y_FIT_VERTICAL_PHASE_WEIGHT = 1.30
 Y_FIT_EDGE_WEIGHT_FLOOR = 0.45
 
@@ -633,6 +638,12 @@ def main():
                     target_y_norm = float(cy / max(float(sh - 1), 1.0))
                     max_x_off = _guide_offset_limit(target_x_norm)
                     max_y_off = _guide_offset_limit(target_y_norm)
+                    # Center-column/row targets need enough temporary authority
+                    # to neutralize large startup bias before capture begins.
+                    if abs(target_x_norm - 0.5) <= 0.18:
+                        max_x_off = max(max_x_off, GUIDE_OFFSET_CENTER_FLOOR_X)
+                    if abs(target_y_norm - 0.5) <= 0.18:
+                        max_y_off = max(max_y_off, GUIDE_OFFSET_CENTER_FLOOR_Y)
                     y_exc = abs(target_y_norm - 0.5) / 0.5
                     # At top/bottom targets, expand temporary Y guide authority.
                     # This compensates strong initial vertical bias so the cursor
@@ -642,7 +653,10 @@ def main():
                     )
                     max_y_off *= y_edge_scale
                     if target.get("phase") == "vertical":
-                        max_x_off *= GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE
+                        max_x_off = max(
+                            max_x_off * GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE,
+                            GUIDE_OFFSET_VERTICAL_PHASE_X_FLOOR,
+                        )
                         max_y_off *= GUIDE_OFFSET_VERTICAL_PHASE_Y_SCALE
                     max_x_off = max(GUIDE_OFFSET_MIN_EFFECTIVE, float(max_x_off))
                     max_y_off = max(GUIDE_OFFSET_MIN_EFFECTIVE, float(max_y_off))
@@ -656,8 +670,13 @@ def main():
                         if capture_started_at is None:
                             err_x = (cx - float(sx_i)) / max(float(sw - 1), 1.0)
                             err_y = (cy - float(sy_i)) / max(float(sh - 1), 1.0)
-                            next_x_off = mapper.x_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_x
-                            next_y_off = mapper.y_offset * (1.0 - GUIDE_OFFSET_DECAY) + GUIDE_OFFSET_ADAPT_GAIN * err_y
+                            err_mag = max(abs(err_x), abs(err_y))
+                            gain_scale = 1.0 + GUIDE_OFFSET_ERR_GAIN_SCALE * float(
+                                np.clip(err_mag / GUIDE_OFFSET_ERR_GAIN_REF, 0.0, 1.0)
+                            )
+                            adapt_gain = GUIDE_OFFSET_ADAPT_GAIN * gain_scale
+                            next_x_off = mapper.x_offset * (1.0 - GUIDE_OFFSET_DECAY) + adapt_gain * err_x
+                            next_y_off = mapper.y_offset * (1.0 - GUIDE_OFFSET_DECAY) + adapt_gain * err_y
                             mapper.set_x_offset(float(np.clip(next_x_off, -max_x_off, max_x_off)))
                             mapper.set_y_offset(float(np.clip(next_y_off, -max_y_off, max_y_off)))
 
