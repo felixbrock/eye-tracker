@@ -85,3 +85,12 @@ for_window [title="^gaze$"] floating enable, border none, sticky enable
 for_window [title="^Calibration$"] floating enable, border none
 for_window [title="^Eye Tracker Debug$"] floating enable
 ```
+
+## Tab Navigation Split
+
+The Chromium tab-navigation stack was moved to:
+
+- `/home/felix/repos/browser-eye-navigation`
+
+That repository now contains `tab_calibration.py`, `tab_test.py`, `tab_tracker.py`,
+the Chromium extensions, and `train_tab`.
