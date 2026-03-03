@@ -63,6 +63,10 @@ GUIDE_OFFSET_DECAY = 0.06
 GUIDE_OFFSET_MIN = 0.07
 GUIDE_OFFSET_MAX = 0.24
 GUIDE_OFFSET_EDGE_EXCURSION = 0.30
+GUIDE_OFFSET_MIN_EFFECTIVE = 0.05
+GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MIN = 0.40
+GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE = 0.55
+GUIDE_OFFSET_VERTICAL_PHASE_Y_SCALE = 0.68
 Y_FIT_VERTICAL_PHASE_WEIGHT = 1.30
 Y_FIT_EDGE_WEIGHT_FLOOR = 0.45
 
@@ -629,6 +633,16 @@ def main():
                     target_y_norm = float(cy / max(float(sh - 1), 1.0))
                     max_x_off = _guide_offset_limit(target_x_norm)
                     max_y_off = _guide_offset_limit(target_y_norm)
+                    y_exc = abs(target_y_norm - 0.5) / 0.5
+                    y_edge_scale = float(
+                        np.clip(1.0 - 0.55 * y_exc, GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MIN, 1.0)
+                    )
+                    max_y_off *= y_edge_scale
+                    if target.get("phase") == "vertical":
+                        max_x_off *= GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE
+                        max_y_off *= GUIDE_OFFSET_VERTICAL_PHASE_Y_SCALE
+                    max_x_off = max(GUIDE_OFFSET_MIN_EFFECTIVE, float(max_x_off))
+                    max_y_off = max(GUIDE_OFFSET_MIN_EFFECTIVE, float(max_y_off))
                     for flip_y, mapper in probe_mappers.items():
                         sx_i, sy_i = mapper.map(h, v)
                         mapped_points[flip_y] = (sx_i, sy_i)

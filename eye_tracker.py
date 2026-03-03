@@ -122,9 +122,10 @@ CALIBRATION_BOOST_ALPHA = 0.22
 CALIBRATION_SOFT_CLIP_STRENGTH = 1.60
 CALIBRATION_SOFT_CLIP_MAX_STRENGTH = 3.00
 CALIBRATION_DYNAMIC_COUPLING_MIN_SAMPLES = 32
-CALIBRATION_DYNAMIC_COUPLING_MAX_ABS = 0.75
-CALIBRATION_DYNAMIC_COUPLING_ALPHA = 0.18
-CALIBRATION_DYNAMIC_CENTER_ALPHA = 0.12
+CALIBRATION_DYNAMIC_COUPLING_MIN_H_SPAN = 0.050
+CALIBRATION_DYNAMIC_COUPLING_MAX_ABS = 0.35
+CALIBRATION_DYNAMIC_COUPLING_ALPHA = 0.08
+CALIBRATION_DYNAMIC_CENTER_ALPHA = 0.08
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -483,7 +484,6 @@ class GazeMapper:
         self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_locked = True
-        self._calibration_coupling_locked = True
 
     def _estimate_calibration_yx_coupling(self):
         if self._calibration_coupling_locked:
@@ -503,11 +503,18 @@ class GazeMapper:
             (np.abs(h_dev) <= (3.5 * h_mad + 0.01))
             & (np.abs(v_dev) <= (3.5 * v_mad + 0.01))
         )
+        # Estimate leakage mainly from near-constant vertical gaze slices.
+        # This avoids fitting coupling from deliberate top/bottom transitions.
+        near_row_band = max(2.5 * v_mad, 0.012)
+        keep &= np.abs(v_dev) <= near_row_band
         if int(np.count_nonzero(keep)) < CALIBRATION_DYNAMIC_COUPLING_MIN_SAMPLES:
             return self._dynamic_yx_coupling, self._dynamic_yx_center
 
         h_keep = hs[keep]
         v_keep = vs[keep]
+        h_p05, h_p95 = np.percentile(h_keep, [5, 95])
+        if float(h_p95 - h_p05) < CALIBRATION_DYNAMIC_COUPLING_MIN_H_SPAN:
+            return self._dynamic_yx_coupling, self._dynamic_yx_center
         h_center = float(np.median(h_keep))
         h_c = h_keep - h_center
         v_c = v_keep - float(np.median(v_keep))
