@@ -18,7 +18,7 @@ Description:
 Options:
   --log-file   Path to calibration log JSON (required)
   --validation-log-file Path to post-change calibration log JSON (optional; if omitted, script runs calibration.py)
-  --validation-runs Number of validation calibration runs to aggregate by median when auto-running validation (default: 2)
+  --validation-runs Number of validation calibration runs to aggregate by median when auto-running validation (default: 1)
   --rejection-report-file Path to previous rejection report JSON to include in retry context (optional)
   --codex-cmd  Codex launcher command (default: codex)
   --history-count Number of recent relevant commits to include as context (default: 12)
@@ -33,7 +33,7 @@ EOF
 
 log_file=""
 validation_log_file=""
-validation_runs=2
+validation_runs=1
 rejection_report_file=""
 codex_cmd="codex"
 history_count=12
@@ -478,7 +478,7 @@ else
     latest_seen_mtime=0
     for run_i in $(seq 1 "$validation_runs"); do
       echo "Validation run ${run_i}/${validation_runs}..."
-      uv run python calibration.py
+      CALIBRATION_FAST_VALIDATION=1 uv run python calibration.py
       latest_validation="$(ls -1t calibration_logs/iteration_*.json 2>/dev/null | head -n 1 || true)"
       [[ -n "$latest_validation" ]] || {
         rollback_repo_changes

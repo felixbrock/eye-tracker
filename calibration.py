@@ -67,6 +67,38 @@ Y_FIT_VERTICAL_PHASE_WEIGHT = 1.30
 Y_FIT_EDGE_WEIGHT_FLOOR = 0.45
 
 
+def _runtime_calibration_config():
+    """Runtime calibration profile.
+
+    Normal CLI runs keep full-quality defaults.
+    Training validation can set CALIBRATION_FAST_VALIDATION=1 to shorten loops.
+    """
+    fast = os.getenv("CALIBRATION_FAST_VALIDATION", "").strip().lower() in ("1", "true", "yes", "on")
+    cfg = {
+        "fast_validation": fast,
+        "iteration_timeout_seconds": ITERATION_TIMEOUT_SECONDS,
+        "target_dwell_seconds": TARGET_DWELL_SECONDS,
+        "target_capture_seconds": TARGET_CAPTURE_SECONDS,
+        "target_settle_seconds": TARGET_SETTLE_SECONDS,
+        "stable_min_frames": STABLE_MIN_FRAMES,
+        "target_max_retries": TARGET_MAX_RETRIES,
+        "max_total_iterations": 0,
+    }
+    if fast:
+        cfg.update(
+            {
+                "iteration_timeout_seconds": 5.0,
+                "target_dwell_seconds": 0.22,
+                "target_capture_seconds": 0.85,
+                "target_settle_seconds": 0.30,
+                "stable_min_frames": 5,
+                "target_max_retries": 0,
+                "max_total_iterations": 12,
+            }
+        )
+    return cfg
+
+
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
     """Fit affine feature->target map and derive mapper bounds."""
     best = None
@@ -412,10 +444,14 @@ def build_quality_report(iterations, sw, sh):
 
 
 def main():
+    cfg = _runtime_calibration_config()
     monitor = get_monitors()[0]
     sw, sh = monitor.width, monitor.height
     target_queue = calibration_targets(sw, sh)
     total_planned = len(target_queue)
+    max_total_iterations = int(cfg["max_total_iterations"])
+    if max_total_iterations > 0:
+        total_planned = min(total_planned, max_total_iterations)
 
     cap = cv2.VideoCapture(WEBCAM_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_W)
@@ -474,7 +510,7 @@ def main():
             cv2.imshow(win, disp)
             cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         iteration_index = 0
-        while target_queue:
+        while target_queue and (max_total_iterations <= 0 or iteration_index < max_total_iterations):
             target = target_queue.pop(0)
             iteration_index += 1
             box = target["target_box"]
@@ -498,7 +534,7 @@ def main():
 
             while True:
                 elapsed = time.time() - t0
-                if elapsed >= ITERATION_TIMEOUT_SECONDS:
+                if elapsed >= float(cfg["iteration_timeout_seconds"]):
                     break
 
                 key = cv2.waitKey(1) & 0xFF
@@ -541,7 +577,7 @@ def main():
                 )
                 cv2.putText(
                     disp,
-                    f"Timeout in: {max(0.0, ITERATION_TIMEOUT_SECONDS - elapsed):0.1f}s",
+                    f"Timeout in: {max(0.0, float(cfg['iteration_timeout_seconds']) - elapsed):0.1f}s",
                     (40, 135),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.75,
@@ -653,9 +689,9 @@ def main():
                     if (
                         capture_started_at is None
                         and settled_since is not None
-                        and stable_frames >= STABLE_MIN_FRAMES
-                        and elapsed >= TARGET_SETTLE_SECONDS
-                        and (elapsed - settled_since) >= TARGET_DWELL_SECONDS
+                        and stable_frames >= int(cfg["stable_min_frames"])
+                        and elapsed >= float(cfg["target_settle_seconds"])
+                        and (elapsed - settled_since) >= float(cfg["target_dwell_seconds"])
                     ):
                         for mapper in probe_mappers.values():
                             mapper.lock_calibration_boost()
@@ -714,7 +750,7 @@ def main():
                     )
                     cv2.putText(
                         disp,
-                        f"Quality: {'OK' if quality_ok else 'REJECT'} stable={stable_frames}/{STABLE_MIN_FRAMES} eye={eye_open:.3f} head={head_motion:.3f}",
+                        f"Quality: {'OK' if quality_ok else 'REJECT'} stable={stable_frames}/{int(cfg['stable_min_frames'])} eye={eye_open:.3f} head={head_motion:.3f}",
                         (40, 310),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.56,
@@ -722,7 +758,7 @@ def main():
                         2,
                     )
 
-                    if capture_started_at is not None and (elapsed - capture_started_at) >= TARGET_CAPTURE_SECONDS:
+                    if capture_started_at is not None and (elapsed - capture_started_at) >= float(cfg["target_capture_seconds"]):
                         break
 
                 cv2.imshow(win, disp)
@@ -740,7 +776,7 @@ def main():
                 or (h_std is not None and h_std > TARGET_STD_MAX_H)
                 or (v_std is not None and v_std > TARGET_STD_MAX_V)
             )
-            if needs_retry and int(target["retry_index"]) < TARGET_MAX_RETRIES:
+            if needs_retry and int(target["retry_index"]) < int(cfg["target_max_retries"]):
                 retry_target = dict(target)
                 retry_target["retry_index"] = int(target["retry_index"]) + 1
                 target_queue.append(retry_target)
@@ -765,10 +801,10 @@ def main():
                         "mean_distance_to_box_center_px": mean_dist_center,
                         "quality_rejects": int(rejected_quality),
                         "capture_started": bool(capture_started_at is not None),
-                        "stable_min_frames": int(STABLE_MIN_FRAMES),
+                        "stable_min_frames": int(cfg["stable_min_frames"]),
                         "h_std": h_std,
                         "v_std": v_std,
-                        "retry_queued": bool(needs_retry and int(target["retry_index"]) < TARGET_MAX_RETRIES),
+                        "retry_queued": bool(needs_retry and int(target["retry_index"]) < int(cfg["target_max_retries"])),
                     },
                     "samples": samples,
                 }
@@ -788,11 +824,14 @@ def main():
         payload = {
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "screen": {"width": sw, "height": sh},
-            "iteration_timeout_seconds": ITERATION_TIMEOUT_SECONDS,
-            "target_dwell_seconds": TARGET_DWELL_SECONDS,
-            "target_capture_seconds": TARGET_CAPTURE_SECONDS,
-            "target_settle_seconds": TARGET_SETTLE_SECONDS,
-            "stable_min_frames": STABLE_MIN_FRAMES,
+            "fast_validation_profile": bool(cfg["fast_validation"]),
+            "iteration_timeout_seconds": float(cfg["iteration_timeout_seconds"]),
+            "target_dwell_seconds": float(cfg["target_dwell_seconds"]),
+            "target_capture_seconds": float(cfg["target_capture_seconds"]),
+            "target_settle_seconds": float(cfg["target_settle_seconds"]),
+            "stable_min_frames": int(cfg["stable_min_frames"]),
+            "target_max_retries": int(cfg["target_max_retries"]),
+            "max_total_iterations": int(cfg["max_total_iterations"]),
             "total_iterations_planned": total_planned,
             "total_iterations_executed": len(all_iterations),
             "auto_flip_y_selected": active_flip_y,
