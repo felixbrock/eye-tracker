@@ -64,6 +64,7 @@ GUIDE_OFFSET_MIN = 0.07
 GUIDE_OFFSET_MAX = 0.24
 GUIDE_OFFSET_EDGE_EXCURSION = 0.30
 Y_FIT_VERTICAL_PHASE_WEIGHT = 1.30
+Y_FIT_EDGE_WEIGHT_FLOOR = 0.45
 
 
 def _fit_axis_bounds(features, targets, force_flip=None, weights=None):
@@ -234,7 +235,9 @@ def derive_mapper_settings(payload):
         vs.append(float(g["v_med"] - yx_coupling * (g["h_med"] - h_center)))
         tys.append(float(g["ty"]))
         phase_mul = Y_FIT_VERTICAL_PHASE_WEIGHT if g.get("phase") == "vertical" else 1.0
-        wsy.append(float(g["w"] * phase_mul))
+        x_exc = abs(float(g["tx"]) - 0.5) / 0.5
+        edge_mul = float(np.clip(1.0 - 0.55 * x_exc, Y_FIT_EDGE_WEIGHT_FLOOR, 1.0))
+        wsy.append(float(g["w"] * phase_mul * edge_mul))
 
     fx = _fit_axis_bounds(hs, txs, force_flip=None, weights=wsx)
     fy = _fit_axis_bounds(vs, tys, force_flip=None, weights=wsy)

@@ -121,6 +121,10 @@ CALIBRATION_MAX_AUTO_RANGE_BOOST = 1.60
 CALIBRATION_BOOST_ALPHA = 0.22
 CALIBRATION_SOFT_CLIP_STRENGTH = 1.60
 CALIBRATION_SOFT_CLIP_MAX_STRENGTH = 3.00
+CALIBRATION_DYNAMIC_COUPLING_MIN_SAMPLES = 32
+CALIBRATION_DYNAMIC_COUPLING_MAX_ABS = 0.75
+CALIBRATION_DYNAMIC_COUPLING_ALPHA = 0.18
+CALIBRATION_DYNAMIC_CENTER_ALPHA = 0.12
 
 
 # ─── MediaPipe Landmark Indices ───────────────────────────────────────────────
@@ -331,6 +335,11 @@ class GazeMapper:
         self._calibration_boost_x = 1.0
         self._calibration_boost_y = 1.0
         self._calibration_boost_locked = False
+        self._calibration_coupling_locked = False
+        self._calib_coupling_h_hist = deque(maxlen=RANGE_WINDOW)
+        self._calib_coupling_v_hist = deque(maxlen=RANGE_WINDOW)
+        self._dynamic_yx_coupling = 0.0
+        self._dynamic_yx_center = 0.5
         if load_saved_settings:
             self._load()
 
@@ -460,6 +469,11 @@ class GazeMapper:
         self._calibration_boost_x = 1.0
         self._calibration_boost_y = 1.0
         self._calibration_boost_locked = False
+        self._calibration_coupling_locked = False
+        self._calib_coupling_h_hist.clear()
+        self._calib_coupling_v_hist.clear()
+        self._dynamic_yx_coupling = 0.0
+        self._dynamic_yx_center = 0.5
 
     def lock_calibration_boost(self):
         """Freeze calibration boost after stabilization to avoid mid-capture jumps."""
@@ -469,6 +483,48 @@ class GazeMapper:
         self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_locked = True
+        self._calibration_coupling_locked = True
+
+    def _estimate_calibration_yx_coupling(self):
+        if self._calibration_coupling_locked:
+            return self._dynamic_yx_coupling, self._dynamic_yx_center
+        if len(self._calib_coupling_h_hist) < CALIBRATION_DYNAMIC_COUPLING_MIN_SAMPLES:
+            return self._dynamic_yx_coupling, self._dynamic_yx_center
+
+        hs = np.asarray(self._calib_coupling_h_hist, dtype=float)
+        vs = np.asarray(self._calib_coupling_v_hist, dtype=float)
+        h_med = float(np.median(hs))
+        v_med = float(np.median(vs))
+        h_dev = hs - h_med
+        v_dev = vs - v_med
+        h_mad = float(np.median(np.abs(h_dev))) + 1e-4
+        v_mad = float(np.median(np.abs(v_dev))) + 1e-4
+        keep = (
+            (np.abs(h_dev) <= (3.5 * h_mad + 0.01))
+            & (np.abs(v_dev) <= (3.5 * v_mad + 0.01))
+        )
+        if int(np.count_nonzero(keep)) < CALIBRATION_DYNAMIC_COUPLING_MIN_SAMPLES:
+            return self._dynamic_yx_coupling, self._dynamic_yx_center
+
+        h_keep = hs[keep]
+        v_keep = vs[keep]
+        h_center = float(np.median(h_keep))
+        h_c = h_keep - h_center
+        v_c = v_keep - float(np.median(v_keep))
+        denom = float(np.sum(h_c * h_c))
+        if denom <= 1e-7:
+            return self._dynamic_yx_coupling, self._dynamic_yx_center
+        coupling = float(np.sum(h_c * v_c) / denom)
+        coupling = float(np.clip(coupling, -CALIBRATION_DYNAMIC_COUPLING_MAX_ABS, CALIBRATION_DYNAMIC_COUPLING_MAX_ABS))
+        self._dynamic_yx_coupling = (
+            (1.0 - CALIBRATION_DYNAMIC_COUPLING_ALPHA) * self._dynamic_yx_coupling
+            + CALIBRATION_DYNAMIC_COUPLING_ALPHA * coupling
+        )
+        self._dynamic_yx_center = (
+            (1.0 - CALIBRATION_DYNAMIC_CENTER_ALPHA) * self._dynamic_yx_center
+            + CALIBRATION_DYNAMIC_CENTER_ALPHA * h_center
+        )
+        return self._dynamic_yx_coupling, self._dynamic_yx_center
 
     def _auto_range_boost(self):
         if len(self._range_h_hist) < RANGE_MIN_SAMPLES:
@@ -554,8 +610,16 @@ class GazeMapper:
                 return self.history[-1]
             return self.sw // 2, self.sh // 2
         h, v = filtered
-        if abs(self.y_x_coupling) > 1e-7:
-            v = float(np.clip(v - self.y_x_coupling * (h - self.y_x_center), 0.0, 1.0))
+        self._calib_coupling_h_hist.append(h)
+        self._calib_coupling_v_hist.append(v)
+        dynamic_yx_coupling = 0.0
+        dynamic_yx_center = self.y_x_center
+        if self.calibration_mode:
+            dynamic_yx_coupling, dynamic_yx_center = self._estimate_calibration_yx_coupling()
+        total_yx_coupling = self.y_x_coupling + dynamic_yx_coupling
+        yx_center = dynamic_yx_center if self.calibration_mode else self.y_x_center
+        if abs(total_yx_coupling) > 1e-7:
+            v = float(np.clip(v - total_yx_coupling * (h - yx_center), 0.0, 1.0))
         self._range_h_hist.append(h)
         self._range_v_hist.append(v)
 

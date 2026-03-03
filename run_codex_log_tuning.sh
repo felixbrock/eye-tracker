@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_codex_log_tuning.sh --log-file <path> [--validation-log-file <path>] [--validation-runs <n>] [--codex-cmd <cmd>] [--history-count <n>] [--skip-validation] [--auto-retry|--no-auto-retry] [--max-attempts <n>] [--dry-run]
+  ./run_codex_log_tuning.sh --log-file <path> [--validation-log-file <path>] [--validation-runs <n>] [--rejection-report-file <path>] [--codex-cmd <cmd>] [--history-count <n>] [--skip-validation] [--auto-retry|--no-auto-retry] [--max-attempts <n>] [--dry-run]
 
 Description:
   Builds a prompt embedding the given log file and starts a new Codex CLI session
@@ -19,6 +19,7 @@ Options:
   --log-file   Path to calibration log JSON (required)
   --validation-log-file Path to post-change calibration log JSON (optional; if omitted, script runs calibration.py)
   --validation-runs Number of validation calibration runs to aggregate by median when auto-running validation (default: 2)
+  --rejection-report-file Path to previous rejection report JSON to include in retry context (optional)
   --codex-cmd  Codex launcher command (default: codex)
   --history-count Number of recent relevant commits to include as context (default: 12)
   --skip-validation Skip performance gates and commit directly after syntax checks
@@ -33,6 +34,7 @@ EOF
 log_file=""
 validation_log_file=""
 validation_runs=2
+rejection_report_file=""
 codex_cmd="codex"
 history_count=12
 skip_validation=0
@@ -64,6 +66,11 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "ERROR: --validation-runs requires a value" >&2; exit 2; }
       [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: --validation-runs must be a non-negative integer" >&2; exit 2; }
       validation_runs="$2"
+      shift 2
+      ;;
+    --rejection-report-file)
+      [[ $# -ge 2 ]] || { echo "ERROR: --rejection-report-file requires a value" >&2; exit 2; }
+      rejection_report_file="$2"
       shift 2
       ;;
     --history-count)
@@ -117,6 +124,9 @@ done
 if [[ -n "$validation_log_file" ]]; then
   [[ -f "$validation_log_file" ]] || { echo "ERROR: validation log file not found: $validation_log_file" >&2; exit 1; }
 fi
+if [[ -n "$rejection_report_file" ]]; then
+  [[ -f "$rejection_report_file" ]] || { echo "ERROR: rejection report file not found: $rejection_report_file" >&2; exit 1; }
+fi
 if [[ "$validation_runs" -lt 1 ]]; then
   echo "ERROR: --validation-runs must be >= 1" >&2
   exit 1
@@ -147,6 +157,11 @@ if [[ -n "$validation_log_file" ]]; then
   abs_validation_log_file="$(realpath "$validation_log_file")"
 else
   abs_validation_log_file=""
+fi
+if [[ -n "$rejection_report_file" ]]; then
+  abs_rejection_report_file="$(realpath "$rejection_report_file")"
+else
+  abs_rejection_report_file=""
 fi
 tmp_prompt="$(mktemp)"
 tmp_history="$(mktemp)"
@@ -367,6 +382,11 @@ if [[ ! -s "$tmp_history" ]]; then
   printf 'No prior relevant commits were found for eye-tracker tuning files.\n' > "$tmp_history"
 fi
 
+rejection_context="No previous rejection report provided."
+if [[ -n "$abs_rejection_report_file" ]]; then
+  rejection_context="$(cat "$abs_rejection_report_file")"
+fi
+
 {
   cat <<EOF
 You are in /home/felix/repos/eye-tracker.
@@ -398,6 +418,14 @@ Relevant recent git history (newest first):
 EOF
   echo '```text'
   cat "$tmp_history"
+  echo
+  echo '```'
+  cat <<EOF
+
+Previous rejection context (if any):
+EOF
+  echo '```json'
+  echo "$rejection_context"
   echo
   echo '```'
   cat <<EOF
@@ -591,6 +619,7 @@ PY
           --codex-cmd "$codex_cmd" \
           --history-count "$history_count" \
           --validation-runs "$validation_runs" \
+          --rejection-report-file "$reject_report" \
           --auto-retry \
           --max-attempts "$max_attempts" \
           --attempt-index "$next_attempt"
