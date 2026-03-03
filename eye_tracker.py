@@ -484,6 +484,9 @@ class GazeMapper:
         self._calibration_boost_x = float(np.clip(abx, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_y = float(np.clip(aby, 1.0, CALIBRATION_MAX_AUTO_RANGE_BOOST))
         self._calibration_boost_locked = True
+        # Keep coupling stable once capture starts so samples are comparable
+        # within and across targets during a single calibration run.
+        self._calibration_coupling_locked = True
 
     def _estimate_calibration_yx_coupling(self):
         if self._calibration_coupling_locked:

@@ -58,15 +58,15 @@ TARGET_MAX_RETRIES = 2
 TARGET_STD_MAX_H = 0.0065
 TARGET_STD_MAX_V = 0.0065
 TARGET_MIN_SAMPLES = 20
-GUIDE_OFFSET_ADAPT_GAIN = 0.022
+GUIDE_OFFSET_ADAPT_GAIN = 0.030
 GUIDE_OFFSET_DECAY = 0.06
 GUIDE_OFFSET_MIN = 0.07
-GUIDE_OFFSET_MAX = 0.24
+GUIDE_OFFSET_MAX = 0.34
 GUIDE_OFFSET_EDGE_EXCURSION = 0.30
 GUIDE_OFFSET_MIN_EFFECTIVE = 0.05
-GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MIN = 0.40
+GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MAX = 1.45
 GUIDE_OFFSET_VERTICAL_PHASE_X_SCALE = 0.55
-GUIDE_OFFSET_VERTICAL_PHASE_Y_SCALE = 0.68
+GUIDE_OFFSET_VERTICAL_PHASE_Y_SCALE = 1.10
 Y_FIT_VERTICAL_PHASE_WEIGHT = 1.30
 Y_FIT_EDGE_WEIGHT_FLOOR = 0.45
 
@@ -634,8 +634,11 @@ def main():
                     max_x_off = _guide_offset_limit(target_x_norm)
                     max_y_off = _guide_offset_limit(target_y_norm)
                     y_exc = abs(target_y_norm - 0.5) / 0.5
+                    # At top/bottom targets, expand temporary Y guide authority.
+                    # This compensates strong initial vertical bias so the cursor
+                    # can still reach edge boxes and collect usable samples.
                     y_edge_scale = float(
-                        np.clip(1.0 - 0.55 * y_exc, GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MIN, 1.0)
+                        np.clip(1.0 + 0.55 * y_exc, 1.0, GUIDE_OFFSET_EDGE_VERTICAL_SCALE_MAX)
                     )
                     max_y_off *= y_edge_scale
                     if target.get("phase") == "vertical":
